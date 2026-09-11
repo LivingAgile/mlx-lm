@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import io
 import random
 import unittest
 from typing import List
@@ -18,6 +19,87 @@ from mlx_lm.generate import (
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
+
+
+class TestBatchCacheEvaluation(unittest.TestCase):
+    def test_recurrent_cache_state_during_batch_generation(self):
+        from mlx_lm.generate import generation_stream
+        from mlx_lm.models import qwen3_next
+        from mlx_lm.models.cache import ArraysCache
+
+        mx.random.seed(42)
+        model = qwen3_next.Model(
+            qwen3_next.ModelArgs(
+                model_type="qwen3_next",
+                hidden_size=64,
+                num_hidden_layers=8,
+                intermediate_size=128,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                vocab_size=256,
+                linear_num_value_heads=2,
+                linear_num_key_heads=1,
+                linear_key_head_dim=16,
+                linear_value_head_dim=16,
+                linear_conv_kernel_dim=4,
+                num_experts=4,
+                num_experts_per_tok=2,
+                decoder_sparse_step=1,
+                shared_expert_intermediate_size=64,
+                mlp_only_layers=[],
+                moe_intermediate_size=64,
+                rms_norm_eps=1e-6,
+                head_dim=32,
+                rope_theta=10000.0,
+                partial_rotary_factor=0.25,
+                max_position_embeddings=65536,
+            )
+        )
+        mx.eval(model.parameters())
+        prompts = [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11]]
+        limits = [40, 64]
+        processors = make_logits_processors({7: 2000.0})
+        generator = BatchGenerator(
+            model, prefill_batch_size=1, logits_processors=processors
+        )
+        uids = generator.insert(prompts, max_tokens=limits)
+        tokens = {uid: [] for uid in uids}
+        finishes = {}
+        steps = 0
+        while responses := generator.next_generated():
+            steps += 1
+            for response in responses:
+                tokens[response.uid].append(response.token)
+                if response.finish_reason is not None:
+                    finishes[response.uid] = response.finish_reason
+                    self.assertIsNotNone(response.prompt_cache)
+            if steps in (32, 60):
+                mx.synchronize(generation_stream)
+                caches = generator._generation_batch.prompt_cache
+                recurrent = [
+                    cache for cache in caches if isinstance(cache, ArraysCache)
+                ]
+                self.assertEqual(len(recurrent), 6)
+                for layer, cache in enumerate(recurrent):
+                    with self.subTest(step=steps, layer=layer):
+                        graph = io.StringIO()
+                        mx.export_to_dot(graph, cache.left_padding)
+                        self.assertNotIn("->", graph.getvalue())
+
+        self.assertEqual([len(tokens[uid]) for uid in uids], limits)
+        self.assertEqual(finishes, dict.fromkeys(uids, "length"))
+        self.assertEqual(generator._generation_batch.prompt_cache, [])
+        for uid, prompt, limit in zip(uids, prompts, limits):
+            expected = [
+                token
+                for token, _ in generate_step(
+                    mx.array(prompt),
+                    model,
+                    max_tokens=limit,
+                    logits_processors=processors,
+                )
+            ]
+            self.assertEqual(tokens[uid], expected)
 
 
 class TestGenerate(unittest.TestCase):

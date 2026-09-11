@@ -705,7 +705,8 @@ class ArraysCache(_BaseCache):
         n_state = len(caches[0].cache)
         B = len(caches)
         cache = cls(n_state)
-        cache.left_padding = mx.array([0] * B)
+        if all(item.empty() for item in caches):
+            cache.left_padding = mx.array([0] * B)
 
         for e in range(n_state):
             non_none = [(i, c[e]) for i, c in enumerate(caches) if c[e] is not None]

@@ -23,7 +23,7 @@ from typing import (
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_reduce
+from mlx.utils import tree_flatten, tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .models import cache
@@ -1390,7 +1390,21 @@ class GenerationBatch:
         # asynchronously
         self._next_tokens = sampled
         self._next_logprobs = logprobs
-        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+        cache_arrays = [
+            value
+            for _, value in tree_flatten([item.state for item in self.prompt_cache])
+            if isinstance(value, mx.array)
+        ]
+        cache_arrays.extend(
+            value
+            for item in self.prompt_cache
+            if isinstance(item, ArraysCache)
+            for value in (item.lengths, item.left_padding)
+            if isinstance(value, mx.array)
+        )
+        mx.async_eval(
+            self._next_tokens, self._next_logprobs, token_context, cache_arrays
+        )
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
