@@ -546,6 +546,107 @@ class TestModels(unittest.TestCase):
             args.n_layers,
         )
 
+    def test_qwen4_exp(self):
+        from mlx_lm.models import qwen4_exp
+
+        args = qwen4_exp.ModelArgs(
+            model_type="qwen4_exp",
+            text_config=dict(
+                hidden_size=64,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                vocab_size=10_000,
+                rms_norm_eps=1e-6,
+                full_attention_interval=4,
+                num_experts=8,
+                num_experts_per_tok=2,
+                moe_intermediate_size=32,
+                shared_expert_intermediate_size=32,
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+                linear_key_head_dim=16,
+                linear_value_head_dim=16,
+                linear_conv_kernel_dim=4,
+                hc_count=4,
+                hc_lowrank=16,
+                indexer_n_heads=2,
+                indexer_kv_heads=1,
+                indexer_head_dim=16,
+                indexer_budget=8,
+                indexer_compress_ratio=4,
+                ngram_size=3,
+                heads_per_ngram=2,
+                ngram_vocab_size_base=101,
+                split_ngram_parts=4,
+                ple_embed_dim=64,
+                ple_layer_ids=[2],
+                eos_token_id=1,
+                rope_parameters={
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                },
+            ),
+        )
+        model = qwen4_exp.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.text.vocab_size, args.text.num_hidden_layers
+        )
+
+        cache = make_prompt_cache(model)
+        inputs = mx.array([list(range(2, 24))])
+        outputs = model(inputs, cache=cache)
+        self.assertEqual(outputs.shape, (1, 22, args.text.vocab_size))
+        outputs = model(mx.array([[7]]), cache=cache)
+        self.assertEqual(outputs.shape, (1, 1, args.text.vocab_size))
+
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        other = mx.concatenate([inputs[:, :-1], mx.array([[997]])], axis=-1)
+        prefill = model(inputs)
+        self.assertTrue(mx.allclose(prefill[:, :-1], model(other)[:, :-1]))
+
+        cache = make_prompt_cache(model)
+        steps = [model(inputs[:, i : i + 1], cache=cache) for i in range(22)]
+        self.assertTrue(mx.allclose(prefill, mx.concatenate(steps, axis=1), atol=1e-4))
+
+        lengths = [22, 15]
+        rows = [mx.array([list(range(2, 2 + length))]) for length in lengths]
+        per_row = [make_prompt_cache(model) for _ in lengths]
+        for row, row_cache in zip(rows, per_row):
+            model(row, cache=row_cache)
+        batch_cache = [cs[0].merge(list(cs)) for cs in zip(*per_row)]
+
+        step = mx.array([[31], [31]])
+        batched = model(step, cache=batch_cache)
+        solo = [model(step[:1], cache=row_cache) for row_cache in per_row]
+        for index, expected in enumerate(solo):
+            self.assertTrue(
+                mx.allclose(batched[index : index + 1], expected, atol=1e-4)
+            )
+
+        padding = [max(lengths) - length for length in lengths]
+        batch_cache = [
+            cs[0].merge(list(cs))
+            for cs in zip(*[make_prompt_cache(model) for _ in lengths])
+        ]
+        for item in batch_cache:
+            item.prepare(lengths=lengths, right_padding=padding)
+        model(
+            mx.concatenate(
+                [mx.pad(row, [(0, 0), (0, pad)]) for row, pad in zip(rows, padding)]
+            ),
+            cache=batch_cache,
+        )
+        for item in batch_cache:
+            item.finalize()
+        batched = model(step, cache=batch_cache)
+        for index, expected in enumerate(solo):
+            self.assertTrue(
+                mx.allclose(batched[index : index + 1], expected, atol=1e-4)
+            )
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 
