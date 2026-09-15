@@ -1,0 +1,9 @@
+id: gl-w-00
+cwd: D:\git\_mirrors\mlx-lm-contributions\.conductor-worktrees\run-38f33665221a\wt-000
+client_name: sdk
+name: 'Implement the first retained-candidate M2 slice in this MLX-LM repo from plan-0051-deepseek-v41. Build exact deepseek_v41 architecture support sufficient for production-module numerical tests without full weights. Ground in existing local model patterns and the official source/evidence under D:\git\Local-AI-Strategy\plans\plan-0051-deepseek-v41-flash-official (especially plan.md and artifacts/m1-architecture-trace.md, m1-gap-closure.md). Scope this slice to: exact config dataclasses/registration...'
+user_named: false
+summary_count: 0
+fork_count: 0
+created_at: 2026-09-15T13:47:24.315Z
+updated_at: 2026-09-15T13:47:24.356Z
