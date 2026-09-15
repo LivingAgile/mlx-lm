@@ -1,0 +1,290 @@
+0222|class TestDeepseekV41Config(unittest.TestCase):
+0225|    def test_full_official_config_round_trips(self):
+0238|    def test_compress_ratios_matches_exact_pinned_official_43_entries(self):
+0261|    def test_compress_ratios_wrong_cardinality_fails_closed(self):
+0274|    def test_compress_ratios_overlong_cardinality_fails_closed(self):
+0282|    def test_missing_engram_field_fails_closed(self):
+0290|    def test_missing_hyper_connections_field_fails_closed(self):
+0298|    def test_missing_index_source_field_fails_closed(self):
+0306|    def test_missing_dspark_field_fails_closed(self):
+0314|    def test_missing_vision_field_fails_closed(self):
+0322|    def test_missing_top_level_text_config_fails_closed(self):
+0328|    def test_v4_shaped_config_is_rejected_not_silently_aliased(self):
+0341|    def test_registered_module_is_not_a_v4_alias(self):
+0351|    def test_model_call_fails_loud_not_fake(self):
+0358|class TestDeepseekV41QuantPrimitives(unittest.TestCase):
+0363|    def test_e8m0_scale_decode_synthetic(self):
+0371|    def test_e8m0_scale_decode_nonfinite(self):
+0378|    def test_fp8_block_dequant_matches_sampled_probe1_bytes(self):
+0400|    def test_fp8_block_dequant_synthetic_2x2_blocks(self):
+0414|    def test_fp8_block_dequant_rejects_shape_mismatch(self):
+0420|    def test_fp8_block_dequant_real_partial_tail_rows(self):
+0450|    def test_fp8_block_dequant_explicit_block_size_rejects_in_axis_tail(self):
+0459|    def test_fp8_block_dequant_explicit_block_size_rejects_grid_mismatch(self):
+0467|    def test_wo_a_dequant_accepts_official_block_sizes(self):
+0475|    def test_wo_a_dequant_rejects_unofficial_block_size(self):
+0481|    def test_wo_a_dequant_rejects_out_axis_tail(self):
+0492|    def test_wo_a_dequant_rejects_undersized_real_byte_tile(self):
+0507|    def test_wo_a_missing_scale_fails_closed_in_sanitize(self):
+0516|    def test_wo_a_orphan_scale_fails_closed_in_sanitize(self):
+0528|    def test_sanitize_dequantizes_wo_a_and_passes_through_others(self):
+0545|    def test_fp4_nibble_order_matches_official_convention(self):
+0551|    def test_fp4_table_matches_official_convert_py_literal(self):
+0558|    def test_fp4_block_dequant_matches_sampled_probe2_bytes(self):
+0578|    def test_fp4_block_dequant_rejects_shape_mismatch(self):
+0584|    def test_fp4_block_dequant_rejects_indivisible_reduction_dim(self):
+0597|    def test_fp4_block_dequant_rejects_scale_grid_mismatch_on_exact_fit(self):
+0649|class TestDeepseekV41LayerPolicies(unittest.TestCase):
+0650|    def test_official_config_resolves_four_kv_sources(self):
+0664|    def test_official_config_ratio_and_source_wiring(self):
+0681|    def test_official_config_candidate_roles(self):
+0702|    def test_rejects_kv_source_that_is_not_an_index_source(self):
+0707|    def test_rejects_candidate_source_that_is_not_an_index_source(self):
+0712|    def test_rejects_index_source_with_zero_compress_ratio(self):
+0717|    def test_rejects_compressing_layer_with_no_preceding_kv_source(self):
+0723|    def test_rejects_consumer_whose_ratio_differs_from_its_source(self):
+0729|    def test_rejects_kv_source_that_does_not_compress(self):
+0736|    def test_rejects_duplicate_and_unsorted_source_ids(self):
+0740|    def test_rejects_out_of_range_source_id(self):
+0745|    def test_rejects_multiple_kv_heads(self):
+0748|    def test_rejects_heads_not_divisible_by_o_groups(self):
+0751|    def test_rejects_non_positive_sliding_window(self):
+0754|    def test_rejects_odd_rope_head_dim(self):
+0757|    def test_rejects_head_dim_not_tiled_by_the_quant_block_sizes(self):
+0760|    def test_rejects_index_head_dim_not_tiled_by_the_fp4_block(self):
+0764|class TestDeepseekV41CacheOwnership(unittest.TestCase):
+0765|    def test_official_config_allocates_exactly_four_physical_owners(self):
+0781|    def test_consumers_share_the_identical_owner_object(self):
+0796|    def test_pure_window_layers_own_no_compressed_state(self):
+0804|    def test_only_ratio_above_one_sources_carry_pooling_state(self):
+0812|    def test_prompt_cache_state_is_refused_rather_than_silently_unshared(self):
+0817|    def test_malformed_config_is_rejected_at_cache_construction(self):
+0824|class TestDeepseekV41PhysicalLatentCache(unittest.TestCase):
+0828|    def test_append_only_growth_preserves_contents(self):
+0841|    def test_non_contiguous_write_is_rejected(self):
+0848|    def test_rewriting_an_existing_slot_is_rejected(self):
+0854|    def test_reading_past_the_written_length_is_rejected(self):
+0861|    def test_wrong_trailing_dimension_is_rejected(self):
+0866|class TestDeepseekV41WindowIndices(unittest.TestCase):
+0867|    def test_prefill_rows_are_causal_and_sentinel_padded(self):
+0876|    def test_prefill_shorter_than_the_window_never_indexes_past_the_chunk(self):
+0881|    def test_decode_lists_the_whole_ring_oldest_first(self):
+0889|    def test_decode_before_the_ring_has_wrapped_masks_unwritten_slots(self):
+0896|    def test_rejects_non_positive_window(self):
+0901|class TestDeepseekV41SparseAttn(unittest.TestCase):
+0911|    def test_selecting_every_position_matches_dense_attention_with_a_sink(self):
+0921|    def test_query_chunking_does_not_change_the_result(self):
+0931|    def test_a_fully_unreachable_row_is_zero_and_not_nan(self):
+0943|    def test_masked_positions_are_ignored_entirely(self):
+0956|    def test_the_sink_suppresses_the_output(self):
+0968|    def test_shape_contract_is_enforced(self):
+0980|class TestDeepseekV41CandidateBlocks(unittest.TestCase):
+0981|    def test_keeps_the_best_blocks_and_always_pins_the_newest(self):
+0992|    def test_unreachable_blocks_are_never_admitted(self):
+1000|    def test_per_query_reachability_during_prefill(self):
+1009|    def test_a_ragged_tail_block_is_handled(self):
+1015|    def test_rejects_degenerate_block_parameters(self):
+1023|class TestDeepseekV41ActQuantRoundtrip(unittest.TestCase):
+1027|    def test_fp8_roundtrip_rounds_half_to_even_on_the_e4m3_grid(self):
+1036|    def test_fp8_roundtrip_saturates_at_the_finite_maximum(self):
+1042|    def test_fp4_roundtrip_matches_the_e2m1_grid_with_ties_to_even(self):
+1049|    def test_fp4_roundtrip_with_e4m3_scales_uses_sixteen_wide_blocks(self):
+1056|    def test_roundtrips_are_idempotent(self):
+1066|    def test_roundtrip_preserves_dtype_and_shape(self):
+1072|    def test_a_partial_tail_block_is_refused_rather_than_padded(self):
+1078|class TestDeepseekV41Rope(unittest.TestCase):
+1079|    def test_inverse_rotation_recovers_the_input(self):
+1088|    def test_only_the_rope_tail_is_touched(self):
+1097|    def test_position_zero_is_the_identity(self):
+1106|    def test_yarn_scaling_only_applies_when_enabled(self):
+1116|    def test_rejects_odd_rope_head_dim(self):
+1121|class TestDeepseekV41AttentionExecution(unittest.TestCase):
+1133|    def test_the_tiny_config_exercises_all_three_compress_ratios(self):
+1139|    def test_prefill_produces_one_output_per_layer(self):
+1149|    def test_token_decode_matches_the_equivalent_prefill(self):
+1169|    def test_batched_token_decode_matches_the_equivalent_prefill(self):
+1185|    def test_compressed_owners_advance_by_position_over_ratio(self):
+1200|    def test_a_ratio_two_source_only_emits_on_complete_groups(self):
+1215|    def test_the_window_ring_never_grows_with_context(self):
+1233|    def test_a_pure_window_layer_reads_no_compressed_state(self):
+1242|    def test_running_a_consumer_before_any_source_fails_loud(self):
+1250|    def test_skipping_the_index_source_fails_loud(self):
+1262|    def test_re_running_an_earlier_layer_fails_loud(self):
+1272|    def test_layers_must_advance_over_the_same_step(self):
+1281|    def test_a_layer_refuses_another_layers_cache(self):
+1289|    def test_chunked_prefill_is_refused_rather_than_approximated(self):
+1299|    def test_stack_arity_is_enforced(self):
+1310|    def test_attn_sink_is_a_learned_per_head_parameter(self):
+1322|    def test_only_source_layers_carry_compressor_and_indexer_weights(self):
+1340|    def test_wo_a_is_consumed_block_diagonally_over_o_groups(self):
+1434|class TestDeepseekV41SinkhornSplit(unittest.TestCase):
+1450|    def test_comb_is_doubly_stochastic_after_the_official_iteration_count(self):
+1462|    def test_a_single_iteration_is_not_yet_doubly_stochastic(self):
+1470|    def test_pre_and_post_activation_ranges(self):
+1481|    def test_zero_mixes_give_the_uniform_doubly_stochastic_fixed_point(self):
+1496|    def test_the_three_segments_are_read_in_the_official_order_and_layout(self):
+1524|    def test_malformed_inputs_fail_closed(self):
+1539|class TestDeepseekV41ResidualStream(unittest.TestCase):
+1542|    def test_expansion_starts_from_four_identical_copies(self):
+1550|    def test_the_identity_pre_mix_selects_copy_zero(self):
+1556|    def test_expanding_then_collapsing_with_the_identity_recovers_the_embedding(self):
+1563|    def test_hc_pre_is_the_pre_mix_weighted_sum_over_copies(self):
+1570|    def test_hc_post_mixes_the_residual_over_the_source_copy_axis(self):
+1586|    def test_hc_pre_and_post_shape_contracts_are_enforced(self):
+1599|    def test_expansion_rejects_a_stream_that_is_already_expanded(self):
+1606|class TestDeepseekV41HyperConnections(unittest.TestCase):
+1619|    def test_parameter_shapes_match_the_pinned_tensor_contract(self):
+1634|    def test_mixes_are_deterministic_and_rms_scale_invariant(self):
+1647|    def test_attention_and_ffn_use_separate_coefficient_sets(self):
+1654|    def test_a_sublayer_step_feeds_its_own_pre_mix_to_the_next_step(self):
+1680|    def test_block_step_reproduces_the_official_forward_ordering(self):
+1704|    def test_an_unknown_sublayer_name_fails_loud(self):
+1710|    def test_a_wrongly_shaped_stream_fails_loud(self):
+1717|    def test_malformed_hyper_connection_config_fails_closed(self):
+1729|class TestDeepseekV41RoutingRule(unittest.TestCase):
+1732|    def test_sqrtsoftplus_matches_the_official_recipe(self):
+1743|    def test_sqrtsoftplus_is_stable_in_both_tails(self):
+1749|    def test_softmax_and_sigmoid_scoring_are_also_supported(self):
+1757|    def test_an_unknown_scoring_function_fails_closed(self):
+1761|    def test_topk_is_descending_and_breaks_ties_by_lowest_index(self):
+1772|    def test_topk_is_bit_identical_across_repeated_calls(self):
+1779|    def test_topk_out_of_range_fails_closed(self):
+1785|    def test_the_correction_bias_steers_selection_but_never_the_weights(self):
+1803|    def test_norm_topk_prob_normalizes_before_the_routed_scaling_factor(self):
+1813|    def test_a_single_active_expert_is_never_renormalized_to_one(self):
+1822|class TestDeepseekV41Gate(unittest.TestCase):
+1823|    def test_official_config_gates_six_of_three_hundred_eighty_four(self):
+1850|    def test_identical_logits_route_deterministically_to_the_lowest_indices(self):
+1860|    def test_the_same_input_produces_bit_identical_routing(self):
+1873|    def test_the_vl_bias_only_applies_inside_image_spans(self):
+1886|    def test_a_vl_mask_against_a_text_only_gate_fails_loud(self):
+1892|    def test_shape_contracts_are_enforced(self):
+1901|    def test_malformed_routing_config_fails_closed(self):
+1916|class TestDeepseekV41PackedExperts(unittest.TestCase):
+1919|    def test_fp4_expert_weights_stay_packed_at_half_a_byte_per_element(self):
+1927|    def test_fp8_weights_use_the_two_dimensional_thirty_two_tiled_scale_grid(self):
+1932|    def test_a_dense_linear_carries_no_scale_at_all(self):
+1937|    def test_dequantization_matches_the_retained_block_primitive(self):
+1949|    def test_a_forward_pass_never_persists_an_unpacked_weight(self):
+1962|    def test_packed_shape_contracts_fail_closed(self):
+1976|    def test_swiglu_limit_clamps_the_up_branch_both_ways_and_the_gate_only_above(self):
+2008|class TestDeepseekV41MoE(unittest.TestCase):
+2018|    def test_routed_and_shared_outputs_are_summed_per_token(self):
+2047|    def test_the_shared_expert_runs_for_every_token_including_unrouted_ones(self):
+2059|    def test_removing_the_shared_expert_leaves_only_the_routed_sum(self):
+2078|    def test_exactly_the_routed_experts_are_unpacked_and_no_others(self):
+2104|    def test_experts_are_still_packed_after_a_forward_pass(self):
+2113|    def test_expert_and_gate_parameter_names_match_the_checkpoint_contract(self):
+2130|    def test_a_single_token_decode_and_a_batch_agree_per_token(self):
+2152|    def test_shape_contract_is_enforced(self):
+2158|class TestDeepseekV41ExpertPartition(unittest.TestCase):
+2163|    def test_the_official_expert_count_splits_evenly_over_real_world_sizes(self):
+2171|    def test_every_expert_is_owned_by_exactly_one_rank(self):
+2179|    def test_an_uneven_split_is_refused_rather_than_leaving_experts_unowned(self):
+2184|    def test_degenerate_partition_arguments_fail_closed(self):
+2189|    def test_a_rank_constructs_only_the_experts_it_owns(self):
+2202|    def test_the_gate_is_replicated_across_ranks_while_experts_are_not(self):
+2215|    def test_executing_a_sharded_moe_fails_loud_instead_of_silently_partial(self):
+2221|    def test_a_world_size_that_does_not_divide_the_experts_fails_at_construction(self):
+2226|class TestDeepseekV41RoutingConfigValidation(unittest.TestCase):
+2232|    def test_the_official_routing_config_validates(self):
+2238|    def test_a_topk_wider_than_the_expert_pool_is_rejected(self):
+2246|    def test_unsupported_routing_variants_are_named_in_the_error(self):
+2360|class TestDeepseekV41EngramNormalization(unittest.TestCase):
+2368|    def test_the_declared_sequence_is_the_official_one(self):
+2375|    def test_case_and_leading_space_collapse(self):
+2379|    def test_accents_are_stripped_after_decomposition(self):
+2385|    def test_compatibility_forms_are_folded(self):
+2388|    def test_a_lone_space_survives_the_strip_via_the_sentinel(self):
+2395|    def test_inner_whitespace_runs_collapse_but_edges_are_trimmed(self):
+2399|    def test_the_empty_string_stays_empty(self):
+2402|    def test_partial_byte_tokens_are_keyed_by_their_raw_form(self):
+2407|    def test_the_map_collapses_equivalent_ids_in_first_seen_order(self):
+2426|    def test_a_whitespace_only_token_keeps_its_own_identity(self):
+2431|    def test_malformed_vocabularies_fail_closed(self):
+2437|    def test_a_slow_tokenizer_is_refused_rather_than_decoded_differently(self):
+2447|class TestDeepseekV41EngramLayout(unittest.TestCase):
+2450|    def test_the_official_layout_tiles_both_tables_exactly(self):
+2464|    def test_every_bucket_range_is_distinct_and_increasing(self):
+2472|    def test_offsets_concatenate_the_ranges_without_gaps(self):
+2488|    def test_find_next_prime_never_reuses(self):
+2499|    def test_multipliers_are_odd_layer_specific_and_overflow_safe(self):
+2515|    def test_disabled_engram_yields_no_layout(self):
+2532|    def test_a_bucket_span_wider_than_the_table_is_rejected(self):
+2537|    def test_malformed_engram_metadata_is_rejected(self):
+2555|    def test_validate_engram_config_checks_the_surrounding_fields(self):
+2565|class TestDeepseekV41EngramHashing(unittest.TestCase):
+2585|    def test_shape_is_one_row_id_per_ngram_size_per_head_per_layer(self):
+2593|    def test_every_id_lands_inside_its_own_bucket_range(self):
+2606|    def test_prefill_in_one_call_equals_token_by_token_decode(self):
+2618|    def test_the_same_ngram_hashes_the_same_wherever_it_occurs(self):
+2626|    def test_tokens_that_normalize_alike_hash_alike(self):
+2632|    def test_an_ngram_never_spans_an_image_span(self):
+2649|    def test_the_two_engram_layers_hash_independently(self):
+2654|    def test_the_history_cache_is_eight_bytes_per_token_per_batch_row(self):
+2660|    def test_reset_makes_the_next_sequence_start_clean(self):
+2677|    def test_out_of_bounds_and_malformed_requests_fail_closed(self):
+2692|    def test_a_token_map_wider_than_the_declared_compressed_vocab_is_rejected(self):
+2704|class TestDeepseekV41EngramRowStore(unittest.TestCase):
+2725|    def test_layout_is_taken_from_the_file_header(self):
+2733|    def test_reads_exactly_the_requested_rows_in_the_requested_order(self):
+2742|    def test_cost_is_counted_and_is_per_row_not_per_file(self):
+2753|    def test_an_empty_request_touches_the_file_at_all(self):
+2760|    def test_a_row_id_past_the_shard_is_refused(self):
+2767|    def test_the_store_closes_and_reopens_its_handle(self):
+2781|    def test_a_wider_than_one_byte_dtype_is_refused(self):
+2787|    def test_a_scale_grid_that_does_not_match_the_rows_is_refused(self):
+2793|    def test_byte_ranges_that_do_not_match_the_shape_are_refused(self):
+2806|    def test_a_missing_tensor_is_refused(self):
+2812|    def test_a_non_default_tensor_naming_can_be_selected(self):
+2829|    def test_a_truncated_file_is_refused_rather_than_read_short(self):
+2838|    def test_a_file_that_is_not_safetensors_at_all_is_refused(self):
+2846|class TestDeepseekV41EngramRowCache(unittest.TestCase):
+2862|    def test_a_cold_gather_reads_each_distinct_row_once(self):
+2878|    def test_a_warm_gather_reads_nothing_at_all(self):
+2887|    def test_rows_come_back_in_request_order(self):
+2903|    def test_residency_is_packed_bytes_of_the_rows_held(self):
+2913|    def test_the_bound_is_never_exceeded_and_evictions_are_counted(self):
+2922|    def test_eviction_is_least_recently_used(self):
+2934|    def test_an_evicted_row_is_refetched_with_identical_bytes(self):
+2942|    def test_a_gather_larger_than_the_bound_is_served_then_trimmed(self):
+2953|    def test_an_empty_gather_is_a_no_op(self):
+2963|    def test_a_cache_that_cannot_hold_a_row_is_refused(self):
+2998|class TestDeepseekV41EngramDequant(unittest.TestCase):
+3001|    def test_rows_decode_to_value_times_two_to_the_scale(self):
+3011|    def test_each_scale_code_governs_exactly_its_own_block(self):
+3021|    def test_an_empty_gather_decodes_to_an_empty_block(self):
+3027|    def test_mismatched_row_blocks_are_refused(self):
+3039|class TestDeepseekV41EngramGate(unittest.TestCase):
+3049|    def test_matches_an_independent_float64_transcription(self):
+3058|    def test_the_gate_is_a_probability_in_the_open_unit_interval(self):
+3068|    def test_normalization_is_per_hc_copy_so_a_rescaled_stream_barely_moves(self):
+3084|    def test_a_silent_stream_lands_on_the_clamp_plateau(self):
+3097|    def test_the_sign_of_the_match_moves_the_gate_across_one_half(self):
+3112|    def test_shape_and_clamp_violations_are_refused(self):
+3128|class TestDeepseekV41EngramEmbedding(unittest.TestCase):
+3149|    def test_the_module_holds_no_dense_table_and_no_parameters_at_all(self):
+3156|    def test_lookup_returns_the_dequantized_rows_for_the_requested_ids(self):
+3169|    def test_resident_bytes_track_the_cache_bound_not_the_table(self):
+3175|    def test_an_empty_lookup_is_well_shaped(self):
+3179|    def test_an_id_outside_the_table_is_refused_rather_than_zeroed(self):
+3188|    def test_a_store_that_does_not_hold_this_rank_shard_is_refused(self):
+3193|    def test_geometry_violations_are_refused(self):
+3201|    def test_a_sharded_lookup_without_a_reducer_fails_loud(self):
+3209|    def test_a_reducer_that_returns_nothing_fails_loud(self):
+3216|    def test_each_rank_zeroes_the_rows_it_does_not_own(self):
+3226|    def test_summing_the_shards_reproduces_the_unsharded_lookup(self):
+3241|    def test_the_injected_reducer_is_the_only_cross_rank_coupling(self):
+3252|    def test_world_size_one_needs_no_reducer(self):
+3258|class TestDeepseekV41EngramModule(unittest.TestCase):
+3309|    def test_the_stream_shape_survives_the_injection(self):
+3316|    def test_the_lookup_actually_changes_the_stream(self):
+3322|    def test_the_hash_ids_are_what_select_the_injection(self):
+3332|    def test_a_masked_position_passes_through_untouched(self):
+3344|    def test_the_two_engram_layers_inject_different_things(self):
+3357|    def test_a_non_engram_layer_is_refused(self):
+3362|    def test_an_embedding_for_the_wrong_table_is_refused(self):
+3368|    def test_malformed_stream_or_hash_shapes_are_refused(self):
+3381|class TestDeepseekV41EngramMemoryBounds(unittest.TestCase):
+3390|    def test_gather_cost_is_invariant_to_how_large_the_table_is(self):
+3421|    def test_the_hash_history_cache_is_eight_bytes_per_token(self):

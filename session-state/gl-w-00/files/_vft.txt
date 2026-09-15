@@ -1,0 +1,122 @@
+# Value-First Testing Doctrine
+
+Single source of truth for all engine guidance on test design. Every downstream surface references this file; none restate the 10 points.
+
+## The 10-Point Doctrine
+
+### 1. Value-not-mechanism
+
+A test must prove the feature delivers its intended value, not merely that plumbing executed.
+
+**No-op litmus:** *If the feature's real effect were replaced by a no-op but the plumbing stayed in place, would this test still pass?* If yes, the test proves nothing of value.
+
+### 2. Outcome-closes-AC
+
+Only an outcome test may **close** a value acceptance criterion. A fast mechanism or shape assertion (e.g. a packet is well-formed: carries decision + confidence + rationale) may exist inside the story and is valuable for fast feedback ? but it may never be the assertion that marks the AC done.
+
+### 3. Recursive-compositional (fractal)
+
+Compositional/e2e tests are recursive, not just one outer story per feature. Each subsystem complex enough to matter warrants its **own** compositional e2e proving it delivers what the enclosing system needs, plus a composing test proving integration.
+
+The value litmus applies at **every** layer, where "value" = the behavior the enclosing layer requires of this one. The outermost layer = customer/system behavior.
+
+**Apply the litmus at the integration seam, not the mechanism's internals.** The composing test must stub the *enclosing production system's invocation* of the subsystem ? not the subsystem itself. A test that news-up / composes the mechanism and drives it directly proves the components work but proves **zero integration**: a mechanism that is fully built yet never invoked by the running system still passes it. Such a test may close the *component* AC but can **never** close the *integration* AC. Integration-scope litmus: stub the system's call into the mechanism to a no-op (leaving the mechanism intact) ? if the composing test still passes, it tested composition, not integration.
+
+### 4. Right-size-the-subsystem
+
+Build exactly the behavior the enclosing system needs now ? no less (mechanism stub), no more (speculative robustness). Balance the two failure modes ? over-simple ? near-term refactor churn; over-engineered ? unused power ? by consulting the only backlog available: **allocated-but-uncommitted plans + brainstorming directions**. Add modest robustness only when that horizon shows it averts a costly later refactor; never overinvest.
+
+Done-well TDD (simple components, few targeted tests) *fights* design lock-in; the system stays adaptable.
+
+### 5. Few-over-many-for-flexibility
+
+Prefer few fast compositional stories over many piecemeal single-assertion tests. Splitting one test into many adds no coverage (identical summed assertion surface) and costs per-test overhead (discovery, allocation, scheduling, reflection invocation) ? strictly slower for fast cases.
+
+Use **soft assertions** (a SoftAssert-style collector that gathers all sub-failures before throwing) inside a compositional test to see all sub-failures in one run ? this preserves the per-case localization that micro-tests offered. *Note:* MSTest 4.x ships **no** built-in `Assert.Multiple`; use your repo's soft-assert helper (in `engine/tools.Tests` that is `TestSupport/SoftAssert.cs`). A micro-test swarm ossifies design (every refactor rewrites many tests); few high-value tests keep it adaptable.
+
+**Tests are part of the architecture.** A large test body is itself a rigidity cost: the more tests a small change can break, the slower and more change-resistant the inner dev loop becomes. Keep tests clean and KISS/DRY ? "wasteful" tests that don't earn their place are architectural debt, not safety.
+
+TDD's goal is to prove the customer got what they wanted **and** keep the system flexible ? not maximal coverage.
+
+### 6. Tactical-for-regressions
+
+Small tactical tests earn their place for regressions (expose-the-bug ? fix-the-bug, added as bugs occur) and for genuinely orthogonal failure angles. **Capture-the-bug-first is non-negotiable:** every bug fix starts by writing the small tactical test that *reproduces the bug* (red) before the fix. Then make a **deliberate keep-vs-fold decision**: keep the tactical test when it guards an orthogonal/independent failure domain, or **fold** it into the relevant compositional story when that is more maintainable long-term. **Bundle non-parallelizable tactical tests** (statics/global singletons) into compositional stories ? proves several points with one test and frees pipeline concurrency.
+
+### 7. Reviewer+coherence-backstop
+
+Reviewers must constantly ask *"what does this test prove? what is the value?"* Value-less green (mechanism passes, value unproven) is a **defect**, not an approval.
+
+The intent-coherence protocol licenses any agent to **flag** mechanism-without-value **even when the instruction is clear** ? hedging the autonomy asymmetry where agents rarely push back on clear-but-incomplete directions, and structured planning's clarity makes them *less* likely to. The flag is raised (not silently overridden) so the lead/operator adjudicates.
+
+The **primary** lever remains the lead/planner authoring ACs that encode the whole value loop ? backstops catch misses, they do not replace good AC authoring.
+
+### 8. Reachable-through-real-entry (no orphaned production code)
+
+Point 3 proves the *internal* wiring between layers. This point proves the **outermost** layer is reachable from the real world. A value-bearing production capability is delivered only when a real actor can reach it through its **real production entry seam** ? the same path a real agent (MCP tool / RPC), operator (CLI), or internal lifecycle trigger actually uses. For a top-of-stack agent/operator-facing capability, the "enclosing system" of point 3 **is** that live entry path.
+
+**Orphan litmus:** if every path that reaches the capability originates in a test ? no non-test production caller exists and none is scheduled ? it is **orphaned production code = a no-op on the product surface**, however green its unit/component/mock-actor tests are. A capability only test code can invoke is not a delivered feature.
+
+**Real-entry litmus (the loophole point 3 misses):** in an integration/e2e test a mock actor may stand in for *judgment* (mock the lead's reasoning, mock external models) but it must **enter through the real entry seam** (the real RPC route / CLI subcommand / lifecycle trigger), never by constructing the service and calling the internal method directly. Stub the *real entry seam* to a no-op ? the proof must go red. If there is no entry seam to stub, the capability is orphaned. A "mock-actor e2e" that calls the service method directly satisfies point 3's internal stub yet bypasses the real path ? it does **not** close the integration AC.
+
+**Schedule the wiring, not just the proof.** When the real entry seam does not exist yet, the plan must schedule its production wiring as its **own task**. Deferring the *proof* to a later batch while never scheduling the *wiring* the proof requires is a planning-DAG defect ? the deferred proof becomes unreachable (a vanishing point).
+
+**Characterization-conclusion litmus (the symmetric trap).** The loophole runs in reverse too: a *characterization* test that concludes *"no production change is needed ? the shipped surface already does X"* must prove X **through the real entry seam**, not by constructing the service and calling its method. An in-process green proves the *object* does X while the shipped path may not ? concluding "already delivered" from it silently **cancels the very task that would deliver the feature** (the only thing that ships is a test asserting behavior the product lacks). Red flag: the in-process green **contradicts a documented contract or observed real-world behavior**; that contradiction is evidence the test bypassed the real path, *not* evidence the contract is stale. Resolve it through the real seam before concluding no work is needed.
+
+### 9. Anchored-mocks (mock/real dual coverage)
+
+Point 8 reaches the capability from the real entry; this point governs what a test is allowed to **substitute** once inside. Mocks/fakes may replace only the **IO leaves** ? real-world IO that touches production systems, needs credentials, costs money, drifts nondeterministically (e.g. cloud models), or injects latency/variables irrelevant to the test's value. **Never mock the engine/subsystem under test.** Every mocked subsystem must be **anchored** by ?1 test that drives the same core flow through the **real** component, so the mocked path stays **contract-checked against the real path on a schedule**. For nondeterministic IO (cloud models) true equivalence is *not* provable ? seed/fingerprint/structured-output do not guarantee it ? so the anchor is a standing contract test plus a periodic real-path run, not a one-time proof. Prefer **one seam** (factory/strategy/port keyed on a "real-cost tests enabled" flag) with **two modalities**: mock-mode for the fast, side-effect-free inner loop; real-mode at integration/smoke/big-cycle boundaries where cost and latency are acceptable. Coverage must exist from **both sides** ? if a capability is only ever exercised through its mock you are testing the mock, not the system (mock-drift / "testing the mock").
+
+**Anchor litmus:** for any mock, name the test that would still pass if the mock were swapped for real IO. If none exists ? or no real-path run is scheduled ? the mock is **unanchored**: a coverage illusion.
+
+### 10. Contract-anchored (no duplicated production literals)
+
+A test must bind to a production contract ? a path shape, constant, schema field, wire format, enum, on-disk layout ? by resolving it from its **real source** (import the production constant, or discover the value at runtime through the real API/output), never by hardcoding a **copy** of it. A duplicated literal is a silent drift bomb: when a *different* task changes the contract, the copy goes stale and the test either **false-passes** (asserting a shape nothing produces anymore) or fails somewhere no single-task reviewer looks ? invisible until a full-suite run. Coupling to a copy is not "connected to the codebase"; it is connected to a snapshot.
+
+**Drift litmus:** could a change to production alone ? this test file untouched ? make this test assert against a value production no longer emits? If yes, the literal is duplicated, not anchored ? resolve it from the real source (shared constant / runtime discovery / fail-loud resolver).
+
+This is a **cross-task** hazard with two owners: the task that *changes* a shared contract must update or reroute every consumer (blast-radius rule, enforced in planning + review); the task that *authors* a test must never plant a duplicated literal for a later task to silently invalidate.
+
+## Canonical Example: Anti-Form and Positive Form
+
+### Anti-example (what happened in B4-T2/T3)
+
+AC said "BubbleAll bubbles each verdict." The test asserted `Outcome == Interim` + packet shape (decision + confidence + rationale fields present). The feature looked done.
+
+The value ? *lead reasons over the evidence, resumes, optionally overrides, and the run reaches the correct goal state* ? was never proven. Replacing `resume_run` with a no-op left the test green. The test proved the bubble *event was raised*, never that the lead could use it.
+
+**No-op litmus application:** stub `resume_run` to return `Terminal` ? bubble-emission test stays green ? it tested nothing of value.
+
+### Positive form
+
+The value AC closes only when a test drives the complete round-trip:
+
+1. Policy emits the leaned decision + evidence.
+2. A mock lead reads it.
+3. `resume_run` re-enters the loop.
+4. Lead **accepts** (near-zero syntax) OR **overrides** with a different decision.
+5. The run reaches the correct goal state for **both** the accept path and the override path.
+
+*That round-trip is the entire value of BubbleAll over autonomous mode.* Subsystem-level tests (B4-T2 review loop, B4-T3 policy) should each prove their own layer's value, and B4-T4 is the composing proof.
+
+### Anti-example 2 (orphaned capability ? point 8)
+
+A blast-radius RED-rollback was fully built and unit-tested (`ResumeFromDetourAsync ? RollbackRedSetAsync`). A "mock-actor e2e" drove it by constructing the service and calling `ResumeFromDetourAsync` **directly**; stubbing an internal Phase-B seam turned it red, so it passed point 3's integration-scope litmus. But **no RPC route and no lifecycle trigger ever called the method** ? every caller was a test. A real operator following the documented `start_run` + `resume_run` protocol could never reach the rollback. The safety lever was a no-op on the product surface.
+
+**Real-entry litmus application:** there was no real entry seam to stub ? the capability was orphaned. The plan's DoD set the bar at "mock-actor checkpoint/detour tests," which the in-process call satisfied; the wiring (a real detour-return entry) was never a scheduled task, so the deferred over-the-lifecycle proof became a vanishing point. **Positive form:** schedule the entry-seam wiring as its own task, then drive the mock actor *through* it so that stubbing the real route turns the rollback proof red.
+### Anti-example 3 (unanchored mock ? point 9)
+
+The conductor worker's `--effort` argv was fully covered by mock-process tests (FakeHandle/FakeFactory assert the built arg list); every test was green. But the mock never ran the real Copilot CLI, so it could not reveal that `claude-haiku-4.5` **rejects** any `--effort` flag at argument validation. The argv was unanchored against the real CLI: live Haiku dispatch failed (`message:null`) while the suite stayed green ? the tests proved the mock's arg-list *shape*, not that the real CLI *accepts* it.
+
+**Anchor litmus application:** no mock test would still pass if the FakeHandle were swapped for the real `copilot` binary with Haiku ? the effort path had no real-CLI anchor. **Positive form:** keep the fast mock-mode arg-list tests, but anchor them with a scheduled real-CLI lane (`GL_BIZ_ALLOW_REAL_MODEL_TESTS`) plus a periodic capability probe (`scripts/probe-model-effort.ps1`) that drives the same dispatch through the real binary, so a model that rejects the flag turns the anchor red. The in-code capability gate + de-escalation ladder then keep the mock and real paths convergent.
+
+### Anti-example 4 (duplicated-literal drift ? point 10)
+
+Live-smoke conductor tests hardcoded the worktree path `.conductor-worktrees/wt-000`. A later, *different* task (plan-0062 B1-T1) changed production to per-run `.conductor-worktrees/run-{token}/wt-{i:D3}`. The tests still compiled and were never run during development (full-suite-only), so the drift was invisible: the hardcoded `wt-000` no longer matched any path production created. No per-task reviewer caught it ? B1-T1's diff never touched those files ? and it surfaced only at the full-suite capstone, needing a whole rescue task (B4-T2) to rebind.
+
+**Drift litmus application:** B1-T1 changed production alone, the test files untouched, and the tests then asserted a `wt-000` shape production no longer emits. **Positive form:** the seam proofs now resolve the run's real worktree root at runtime via a fail-loud `run-*` resolver (`Assert.Fail` on 0 / >1 matches) ? production's own output drives the assertion, so a future path change either still resolves or fails loud, never silently drifts.
+
+### Anti-example 5 (characterization false-positive ? point 8, reverse)
+
+plan-0065 B0-T1 set out to add standalone `mode=start-run` reintegration. Its characterization e2e constructed `new ConductorService(...)` and called `.StartRunAsync(...)` **directly** (real git, mock worker) and was green ? so the task concluded *"start-run already reintegrates; no production change needed."* But the shipped entry surface (`conductor start-run` CLI ? RPC ? `DaemonHost` ? `ConductorService`) does **not** reintegrate: every real start-run dispatch stranded its worker commit, and the doc-contract (`ConductorModels.cs`) explicitly states start-run never auto-reintegrates. The in-process green **contradicted both the contract and reality** ? the tell of a real-entry bypass ? yet it was read as "feature already present," nearly cancelling the whole delivery task; the only thing that would have shipped was a test asserting behavior the product lacks.
+
+**Characterization-conclusion litmus application:** the green contradicted the documented contract *and* observed dispatch ? false positive by real-path bypass, not a stale contract. **Positive form:** drive the characterization through the real entry seam (CLI / `DaemonHost` ? RPC ? `ConductorService`) with a mock agent; stubbing the real route turns it red ? exposing the shipped surface's true behavior and that real production wiring is required.
