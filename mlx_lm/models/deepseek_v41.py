@@ -2479,6 +2479,11 @@ class DeepseekV41PackedLinear(nn.Module):
                 f"unsupported quant {quant!r}; expected 'fp4', 'fp8' or None"
             )
 
+    def __iter__(self):
+        # Immediate public leaves so dict(module) inspects packed state, not
+        # a transient decode. mlx.nn.Module is not a mapping on every runtime.
+        return iter(self.parameters().items())
+
     def dequantized(self) -> mx.array:
         """Decode the packed weight to a dense float32 tensor.
 

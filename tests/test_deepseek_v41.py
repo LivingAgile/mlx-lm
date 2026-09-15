@@ -1630,8 +1630,10 @@ class TestDeepseekV41HyperConnections(unittest.TestCase):
         mx.random.seed(seed)
         config = _tiny_hc_text_config(**overrides)
         hc = DeepseekV41HyperConnections(config)
-        for name in ("hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base"):
-            setattr(hc, name, mx.random.normal(getattr(hc, name).shape))
+        # Distinct keys so attn/ffn coefficient tensors cannot collapse to the
+        # same draw if the PRNG does not advance between calls.
+        for i, name in enumerate(("hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base")):
+            setattr(hc, name, mx.random.normal(getattr(hc, name).shape, key=seed + i + 1))
         hc.hc_attn_scale = mx.array([0.5, 0.5, 0.5], dtype=mx.float32)
         hc.hc_ffn_scale = mx.array([0.5, 0.5, 0.5], dtype=mx.float32)
         return config, hc
@@ -1978,6 +1980,7 @@ class TestDeepseekV41PackedExperts(unittest.TestCase):
         self.assertEqual(after["weight"].dtype, mx.uint8)
         self.assertEqual(after["weight"].shape, (32, 32))
         self.assertNotIn("_dequantized", dict(lin))
+        self.assertNotIn("_dequantized", after)
 
     def test_packed_shape_contracts_fail_closed(self):
         for args in (
