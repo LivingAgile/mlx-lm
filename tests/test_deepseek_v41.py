@@ -2279,19 +2279,65 @@ class TestDeepseekV41ExpertPartition(unittest.TestCase):
 
     def test_sharded_moe_reduces_routed_output_before_shared_expert(self):
         config = _tiny_moe_text_config()
+        x = mx.full((1, 2, config.hidden_size), 0.25, dtype=mx.float32)
+
+        def build_rank(rank):
+            moe = DeepseekV41MoE(
+                config,
+                world_size=2,
+                rank=rank,
+                all_reduce=lambda local: local,
+                expert_quant=None,
+                shared_expert_quant=None,
+                dtype=mx.float32,
+            )
+            moe.gate.weight = mx.ones(moe.gate.weight.shape, dtype=mx.float32)
+            moe.gate.bias = mx.array(
+                [3.0, 0.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0],
+                dtype=mx.float32,
+            )
+            for expert_id in moe.local_expert_ids:
+                expert = moe.expert(expert_id)
+                value = 0.0025 * (expert_id + 1)
+                for linear in (expert.w1, expert.w2, expert.w3):
+                    linear.weight = mx.full(
+                        linear.weight.shape, value, dtype=mx.float32
+                    )
+            return moe
+
+        rank0 = build_rank(0)
+        rank1 = build_rank(1)
+        _zero_expert(rank0.shared_experts)
+        _zero_expert(rank1.shared_experts)
+
+        rank_local = []
+        for moe in (rank0, rank1):
+            captured = []
+            moe.all_reduce = lambda local, captured=captured: captured.append(local) or local
+            moe(x)
+            rank_local.append(captured[0])
+
+        for linear in (
+            rank0.shared_experts.w1,
+            rank0.shared_experts.w2,
+            rank0.shared_experts.w3,
+        ):
+            linear.weight = mx.full(linear.weight.shape, 0.01, dtype=mx.float32)
+        shared = rank0.shared_experts(x.reshape(-1, config.hidden_size)).reshape(x.shape)
         calls = []
 
         def reducer(local):
-            calls.append(np.asarray(local))
-            return local + 3.0
+            calls.append(local)
+            self.assertTrue(np.allclose(np.asarray(local), np.asarray(rank_local[0])))
+            return local + rank_local[1]
 
-        moe = DeepseekV41MoE(
-            config, world_size=2, rank=0, all_reduce=reducer
-        )
-        x = mx.zeros((1, 2, config.hidden_size), dtype=mx.float32)
-        out = moe(x)
+        rank0.all_reduce = reducer
+        out = rank0(x)
+        expected = rank_local[0].reshape(x.shape) + rank_local[1].reshape(x.shape) + shared
         self.assertEqual(len(calls), 1)
-        self.assertTrue(np.allclose(np.asarray(out), 3.0))
+        self.assertFalse(np.allclose(np.asarray(rank_local[1]), 0.0))
+        self.assertFalse(np.allclose(np.asarray(shared), 0.0))
+        self.assertTrue(np.allclose(np.asarray(out), np.asarray(expected), atol=1e-5))
 
     def test_sharded_moe_rejects_an_in_place_reducer_that_returns_none(self):
         config = _tiny_moe_text_config()
