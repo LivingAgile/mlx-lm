@@ -17,16 +17,33 @@ Probe 2: ``layers.0.ffn.experts.0.w1.weight``/``.scale`` from the same shard).
 The FP4 nibble order and magnitude table were independently confirmed
 byte-for-byte against the official ``inference/convert.py`` reference
 converter at that pinned revision (see ``artifacts/m1-gap-closure.md``).
+
+The Hyper-Connections and MoE tests below run the real production modules on
+tiny-but-structurally-faithful configs: the actual ``hc_mult == 4`` /
+20-iteration Sinkhorn split, and the actual sqrtsoftplus + ``noaux_tc``
+routing rule with one shared expert, ``norm_topk_prob`` and
+``routed_scaling_factor`` -- over 8 routed experts and 32-wide hidden dims
+rather than the official 384 x 2304 x 5120 stack, which no assertion here
+needs allocated. The one place the official numbers appear directly is the
+gate itself (384 routed / 6 active), whose projection is small enough to
+build.
 """
 import unittest
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.deepseek_v41 import (
     COMPRESS_KV_FP4_BLOCK_SIZE,
     FP4_E2M1_TABLE,
+    FP4_WEIGHT_BLOCK_SIZE,
     DeepseekV41AttentionStack,
+    DeepseekV41Expert,
+    DeepseekV41Gate,
+    DeepseekV41HyperConnections,
+    DeepseekV41MoE,
+    DeepseekV41PackedLinear,
     ModelArgs,
     Model,
     PhysicalLatentCache,
@@ -39,13 +56,23 @@ from mlx_lm.models.deepseek_v41 import (
     dequantize_fp4_block,
     dequantize_fp8_block,
     dequantize_wo_a,
+    deterministic_topk_indices,
+    expand_hyper_connection_stream,
     fp4_act_quant_roundtrip,
+    hc_post,
+    hc_pre,
+    hc_split_sinkhorn,
     make_deepseek_v41_attention_caches,
+    make_identity_pre_mix,
+    noaux_tc_route,
     resolve_attention_layer_policies,
     rope_cos_sin,
+    routed_expert_partition,
+    routing_scores,
     select_candidate_blocks,
     sparse_attn,
     unpack_fp4_e2m1,
+    validate_moe_routing_config,
     window_topk_idxs,
     yarn_rope_frequencies,
 )
@@ -1290,6 +1317,885 @@ class TestDeepseekV41AttentionExecution(unittest.TestCase):
             layer.wo_b.weight.shape,
             (config.hidden_size, config.o_groups * config.o_lora_rank),
         )
+
+
+def _tiny_hc_text_config(**overrides):
+    """A small config carrying the real hc_mult == 4 / 20-iteration Sinkhorn
+    settings, with a tiny hidden size so the [mix_hc, hc_mult * dim] projection
+    stays a few hundred floats instead of the official 24 x 20480.
+    """
+    cfg = _text_config_dict()
+    cfg.update(
+        {
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "num_nextn_predict_layers": 0,
+            "compress_ratios": [0, 0, 0, 0],
+        }
+    )
+    cfg.update(overrides)
+    return TextConfig.from_dict(cfg)
+
+
+def _tiny_moe_text_config(**overrides):
+    """A small but structurally faithful MoE config: 8 routed experts, 3 active,
+    one shared expert, the real sqrtsoftplus / noaux_tc / norm_topk_prob /
+    routed_scaling_factor=1.5 / swiglu_limit=10 routing rules, and dimensions
+    that are exact multiples of the 32-wide FP4/FP8 weight block so nothing is
+    padded. Deliberately nowhere near the official 384 x 2304 x 5120 expert
+    stack, which no test needs to allocate.
+    """
+    cfg = _text_config_dict()
+    cfg.update(
+        {
+            "hidden_size": 32,
+            "moe_intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_nextn_predict_layers": 0,
+            "compress_ratios": [0, 0, 0, 0],
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 3,
+        }
+    )
+    cfg.update(overrides)
+    return TextConfig.from_dict(cfg)
+
+
+def _fill_packed(linear, lo=0, hi=256, scale_code=127):
+    """Give a packed Linear real, deterministic bytes. E8M0 code 127 is exactly
+    2**0 == 1.0, so the block scale is a no-op and the decoded weight is the
+    raw E2M1/E4M3 grid -- which keeps the expectations below readable.
+    """
+    linear.weight = mx.random.randint(lo, hi, linear.weight.shape).astype(mx.uint8)
+    if linear.quant is not None:
+        linear.scale = mx.full(linear.scale.shape, scale_code).astype(mx.uint8)
+    return linear
+
+
+def _zero_expert(expert):
+    for lin in (expert.w1, expert.w2, expert.w3):
+        lin.weight = mx.zeros(lin.weight.shape, dtype=lin.weight.dtype)
+    return expert
+
+
+def _build_tiny_moe(config=None, seed=0, **kwargs):
+    mx.random.seed(seed)
+    config = _tiny_moe_text_config() if config is None else config
+    moe = DeepseekV41MoE(config, **kwargs)
+    for expert in moe.experts:
+        for lin in (expert.w1, expert.w2, expert.w3):
+            _fill_packed(lin)
+    for lin in (
+        moe.shared_experts.w1,
+        moe.shared_experts.w2,
+        moe.shared_experts.w3,
+    ):
+        # 0x78..0xFF are the E4M3 NaN/large encodings; stay on the finite grid.
+        _fill_packed(lin, hi=120)
+    moe.gate.weight = mx.random.normal(moe.gate.weight.shape) * 0.3
+    moe.gate.bias = mx.random.normal(moe.gate.bias.shape)
+    return config, moe
+
+
+class TestDeepseekV41SinkhornSplit(unittest.TestCase):
+    """hc_split_sinkhorn against inference/kernel.py hc_split_sinkhorn_kernel."""
+
+    HC = 4
+    ITERS = 20
+    EPS = 1e-6
+
+    def _mixes(self, batch=2, seqlen=3):
+        mx.random.seed(11)
+        mix_hc = (2 + self.HC) * self.HC
+        return (
+            mx.random.normal((batch, seqlen, mix_hc)),
+            mx.array([0.7, 1.3, 0.9], dtype=mx.float32),
+            mx.random.normal((mix_hc,)),
+        )
+
+    def test_comb_is_doubly_stochastic_after_the_official_iteration_count(self):
+        mixes, scale, base = self._mixes()
+        _, _, comb = hc_split_sinkhorn(mixes, scale, base, self.HC, self.ITERS, self.EPS)
+        self.assertEqual(comb.shape, (2, 3, self.HC, self.HC))
+        self.assertTrue(mx.all(comb > 0).item())
+        self.assertTrue(
+            mx.allclose(mx.sum(comb, axis=-1), mx.ones((2, 3, self.HC)), atol=2e-3).item()
+        )
+        self.assertTrue(
+            mx.allclose(mx.sum(comb, axis=-2), mx.ones((2, 3, self.HC)), atol=2e-3).item()
+        )
+
+    def test_a_single_iteration_is_not_yet_doubly_stochastic(self):
+        # Guards the iteration count itself: if sinkhorn_iters were ignored the
+        # test above would pass for the wrong reason.
+        mixes, scale, base = self._mixes()
+        _, _, one = hc_split_sinkhorn(mixes, scale, base, self.HC, 1, self.EPS)
+        row_err = mx.max(mx.abs(mx.sum(one, axis=-1) - 1.0)).item()
+        self.assertGreater(row_err, 1e-3)
+
+    def test_pre_and_post_activation_ranges(self):
+        mixes, scale, base = self._mixes()
+        pre, post, _ = hc_split_sinkhorn(mixes, scale, base, self.HC, self.ITERS, self.EPS)
+        self.assertEqual(pre.shape, (2, 3, self.HC))
+        self.assertEqual(post.shape, (2, 3, self.HC))
+        # pre = sigmoid(...) + eps, strictly above the eps floor; post = 2*sigmoid.
+        self.assertTrue(mx.all(pre > self.EPS).item())
+        self.assertTrue(mx.all(pre < 1.0 + 2 * self.EPS).item())
+        self.assertTrue(mx.all(post > 0.0).item())
+        self.assertTrue(mx.all(post < 2.0).item())
+
+    def test_zero_mixes_give_the_uniform_doubly_stochastic_fixed_point(self):
+        mix_hc = (2 + self.HC) * self.HC
+        zeros = mx.zeros((1, 1, mix_hc), dtype=mx.float32)
+        pre, post, comb = hc_split_sinkhorn(
+            zeros,
+            mx.array([0.7, 1.3, 0.9], dtype=mx.float32),
+            mx.zeros((mix_hc,), dtype=mx.float32),
+            self.HC,
+            self.ITERS,
+            self.EPS,
+        )
+        self.assertTrue(mx.allclose(comb, mx.full(comb.shape, 1.0 / self.HC), atol=1e-5).item())
+        self.assertTrue(mx.allclose(pre, mx.full(pre.shape, 0.5 + self.EPS), atol=1e-6).item())
+        self.assertTrue(mx.allclose(post, mx.ones(post.shape), atol=1e-6).item())
+
+    def test_the_three_segments_are_read_in_the_official_order_and_layout(self):
+        # Zeroing the pre/post scales isolates hc_base, so each segment can be
+        # checked against a literal expectation -- including that comb is read
+        # row-major as [j * hc + k], not transposed.
+        mix_hc = (2 + self.HC) * self.HC
+        base = mx.arange(mix_hc, dtype=mx.float32)
+        pre, post, comb = hc_split_sinkhorn(
+            mx.zeros((1, mix_hc), dtype=mx.float32),
+            mx.array([0.0, 0.0, 1.0], dtype=mx.float32),
+            base,
+            self.HC,
+            1,
+            self.EPS,
+        )
+        self.assertTrue(
+            mx.allclose(pre[0], mx.sigmoid(base[: self.HC]) + self.EPS, atol=1e-6).item()
+        )
+        self.assertTrue(
+            mx.allclose(
+                post[0], 2.0 * mx.sigmoid(base[self.HC : 2 * self.HC]), atol=1e-6
+            ).item()
+        )
+        expected = mx.softmax(
+            base[2 * self.HC :].reshape(self.HC, self.HC), axis=-1
+        ) + self.EPS
+        expected = expected / (mx.sum(expected, axis=-2, keepdims=True) + self.EPS)
+        self.assertTrue(mx.allclose(comb[0], expected, atol=1e-6).item())
+
+    def test_malformed_inputs_fail_closed(self):
+        mixes, scale, base = self._mixes()
+        cases = [
+            (mixes[..., :-1], scale, base, self.HC, self.ITERS, self.EPS),
+            (mixes, scale[:2], base, self.HC, self.ITERS, self.EPS),
+            (mixes, scale, base[:-1], self.HC, self.ITERS, self.EPS),
+            (mixes, scale, base, 0, self.ITERS, self.EPS),
+            (mixes, scale, base, self.HC, 0, self.EPS),
+            (mixes, scale, base, self.HC, self.ITERS, 0.0),
+        ]
+        for args in cases:
+            with self.assertRaises(ValueError):
+                hc_split_sinkhorn(*args)
+
+
+class TestDeepseekV41ResidualStream(unittest.TestCase):
+    """The hc_mult == 4 parallel residual stream (Transformer.forward / Block)."""
+
+    def test_expansion_starts_from_four_identical_copies(self):
+        mx.random.seed(3)
+        h = mx.random.normal((2, 3, 5))
+        stream = expand_hyper_connection_stream(h, 4)
+        self.assertEqual(stream.shape, (2, 3, 4, 5))
+        for copy in range(4):
+            self.assertTrue(mx.array_equal(stream[:, :, copy], h).item())
+
+    def test_the_identity_pre_mix_selects_copy_zero(self):
+        pre_mix = make_identity_pre_mix(2, 3, 4)
+        self.assertEqual(pre_mix.shape, (2, 3, 4))
+        self.assertTrue(mx.array_equal(pre_mix[..., 0], mx.ones((2, 3))).item())
+        self.assertTrue(mx.array_equal(pre_mix[..., 1:], mx.zeros((2, 3, 3))).item())
+
+    def test_expanding_then_collapsing_with_the_identity_recovers_the_embedding(self):
+        mx.random.seed(4)
+        h = mx.random.normal((2, 3, 5))
+        stream = expand_hyper_connection_stream(h, 4)
+        collapsed = hc_pre(stream, make_identity_pre_mix(2, 3, 4))
+        self.assertTrue(mx.allclose(collapsed, h, atol=1e-6).item())
+
+    def test_hc_pre_is_the_pre_mix_weighted_sum_over_copies(self):
+        mx.random.seed(5)
+        stream = mx.random.normal((2, 3, 4, 5))
+        pre_mix = mx.random.normal((2, 3, 4))
+        expected = mx.einsum("bshd,bsh->bsd", stream, pre_mix)
+        self.assertTrue(mx.allclose(hc_pre(stream, pre_mix), expected, atol=1e-5).item())
+
+    def test_hc_post_mixes_the_residual_over_the_source_copy_axis(self):
+        # comb[.., j, k] routes residual copy j into output copy k. The
+        # transposed reading is the easy mistake and is numerically plausible,
+        # so it is pinned here rather than left implicit.
+        mx.random.seed(6)
+        residual = mx.random.normal((2, 3, 4, 5))
+        sublayer = mx.random.normal((2, 3, 5))
+        post_mix = mx.random.normal((2, 3, 4))
+        comb = mx.random.normal((2, 3, 4, 4))
+        expected = mx.einsum("bsk,bsd->bskd", post_mix, sublayer) + mx.einsum(
+            "bsjk,bsjd->bskd", comb, residual
+        )
+        got = hc_post(sublayer, residual, post_mix, comb)
+        self.assertEqual(got.shape, (2, 3, 4, 5))
+        self.assertTrue(mx.allclose(got, expected, atol=1e-5).item())
+
+    def test_hc_pre_and_post_shape_contracts_are_enforced(self):
+        stream = mx.zeros((2, 3, 4, 5))
+        with self.assertRaises(ValueError):
+            hc_pre(stream, mx.zeros((2, 3, 3)))
+        with self.assertRaises(ValueError):
+            hc_pre(mx.zeros((5,)), mx.zeros((5,)))
+        with self.assertRaises(ValueError):
+            hc_post(mx.zeros((2, 3, 5)), stream, mx.zeros((2, 3, 3)), mx.zeros((2, 3, 4, 4)))
+        with self.assertRaises(ValueError):
+            hc_post(mx.zeros((2, 3, 5)), stream, mx.zeros((2, 3, 4)), mx.zeros((2, 3, 4, 3)))
+        with self.assertRaises(ValueError):
+            hc_post(mx.zeros((2, 3, 6)), stream, mx.zeros((2, 3, 4)), mx.zeros((2, 3, 4, 4)))
+
+    def test_expansion_rejects_a_stream_that_is_already_expanded(self):
+        with self.assertRaises(ValueError):
+            expand_hyper_connection_stream(mx.zeros((2, 3, 4, 5)), 4)
+        with self.assertRaises(ValueError):
+            make_identity_pre_mix(0, 3, 4)
+
+
+class TestDeepseekV41HyperConnections(unittest.TestCase):
+    """The per-block Hyper-Connection parameters and Block.forward ordering."""
+
+    def _module(self, seed=9, **overrides):
+        mx.random.seed(seed)
+        config = _tiny_hc_text_config(**overrides)
+        hc = DeepseekV41HyperConnections(config)
+        for name in ("hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base"):
+            setattr(hc, name, mx.random.normal(getattr(hc, name).shape))
+        hc.hc_attn_scale = mx.array([0.5, 0.5, 0.5], dtype=mx.float32)
+        hc.hc_ffn_scale = mx.array([0.5, 0.5, 0.5], dtype=mx.float32)
+        return config, hc
+
+    def test_parameter_shapes_match_the_pinned_tensor_contract(self):
+        config = _official_text_config()
+        hc = DeepseekV41HyperConnections(config)
+        mix_hc = (2 + config.hc_mult) * config.hc_mult
+        self.assertEqual(config.hc_mult, 4)
+        self.assertEqual(mix_hc, 24)
+        self.assertEqual(hc.hc_attn_fn.shape, (24, 4 * config.hidden_size))
+        self.assertEqual(hc.hc_ffn_fn.shape, (24, 4 * config.hidden_size))
+        self.assertEqual(hc.hc_attn_base.shape, (24,))
+        self.assertEqual(hc.hc_ffn_base.shape, (24,))
+        self.assertEqual(hc.hc_attn_scale.shape, (3,))
+        self.assertEqual(hc.hc_ffn_scale.shape, (3,))
+        for param in (hc.hc_attn_fn, hc.hc_attn_base, hc.hc_attn_scale):
+            self.assertEqual(param.dtype, mx.float32)
+
+    def test_mixes_are_deterministic_and_rms_scale_invariant(self):
+        config, hc = self._module()
+        x = mx.random.normal((2, 3, config.hc_mult, config.hidden_size))
+        first = hc.attn_mixes(x)
+        again = hc.attn_mixes(x)
+        for a, b in zip(first, again):
+            self.assertTrue(mx.array_equal(a, b).item())
+        # The RMS statistic is taken over the whole flattened hc*d stream, so a
+        # uniform rescale of the stream leaves every coefficient unchanged.
+        scaled = hc.attn_mixes(x * 4.0)
+        for a, b in zip(first, scaled):
+            self.assertTrue(mx.allclose(a, b, atol=1e-4).item())
+
+    def test_attention_and_ffn_use_separate_coefficient_sets(self):
+        config, hc = self._module()
+        x = mx.random.normal((2, 3, config.hc_mult, config.hidden_size))
+        attn_pre = hc.attn_mixes(x)[0]
+        ffn_pre = hc.ffn_mixes(x)[0]
+        self.assertFalse(mx.allclose(attn_pre, ffn_pre, atol=1e-4).item())
+
+    def test_a_sublayer_step_feeds_its_own_pre_mix_to_the_next_step(self):
+        config, hc = self._module()
+        x = mx.random.normal((2, 3, config.hc_mult, config.hidden_size))
+        pre_mix = make_identity_pre_mix(2, 3, config.hc_mult)
+        seen = {}
+
+        def attn(v):
+            seen["attn_in"] = v
+            return v * 2.0
+
+        out, next_pre = hc.sublayer_step(x, pre_mix, attn, "attn")
+        expected_pre, expected_post, expected_comb = hc.attn_mixes(x)
+        # The sublayer sees the stream collapsed with the *incoming* pre-mix.
+        self.assertTrue(
+            mx.allclose(seen["attn_in"], hc_pre(x, pre_mix), atol=1e-6).item()
+        )
+        # ...and the coefficients it produced are handed to the next step.
+        self.assertTrue(mx.allclose(next_pre, expected_pre, atol=1e-6).item())
+        self.assertTrue(
+            mx.allclose(
+                out,
+                hc_post(seen["attn_in"] * 2.0, x, expected_post, expected_comb),
+                atol=1e-5,
+            ).item()
+        )
+
+    def test_block_step_reproduces_the_official_forward_ordering(self):
+        config, hc = self._module()
+        x = mx.random.normal((2, 3, config.hc_mult, config.hidden_size))
+        pre_mix = make_identity_pre_mix(2, 3, config.hc_mult)
+
+        def attn(v):
+            return v * 2.0
+
+        def ffn(v):
+            return v * 3.0
+
+        got, got_pre = hc.block_step(x, pre_mix, attn, ffn)
+
+        attn_pre, attn_post, attn_comb = hc.attn_mixes(x)
+        mid = hc_post(attn(hc_pre(x, pre_mix)), x, attn_post, attn_comb)
+        ffn_pre, ffn_post, ffn_comb = hc.ffn_mixes(mid)
+        # The FFN collapses with the pre-mix *attention* produced, not with the
+        # block's incoming one and not with its own.
+        expected = hc_post(ffn(hc_pre(mid, attn_pre)), mid, ffn_post, ffn_comb)
+
+        self.assertEqual(got.shape, x.shape)
+        self.assertTrue(mx.allclose(got, expected, atol=1e-5).item())
+        self.assertTrue(mx.allclose(got_pre, ffn_pre, atol=1e-6).item())
+
+    def test_an_unknown_sublayer_name_fails_loud(self):
+        config, hc = self._module()
+        x = mx.zeros((1, 1, config.hc_mult, config.hidden_size))
+        with self.assertRaises(ValueError):
+            hc.sublayer_step(x, make_identity_pre_mix(1, 1, config.hc_mult), lambda v: v, "mlp")
+
+    def test_a_wrongly_shaped_stream_fails_loud(self):
+        config, hc = self._module()
+        with self.assertRaises(ValueError):
+            hc.attn_mixes(mx.zeros((2, 3, config.hc_mult + 1, config.hidden_size)))
+        with self.assertRaises(ValueError):
+            hc.attn_mixes(mx.zeros((2, 3, config.hidden_size)))
+
+    def test_malformed_hyper_connection_config_fails_closed(self):
+        for overrides in (
+            {"hc_mult": 0},
+            {"hc_sinkhorn_iters": 0},
+            {"hc_eps": 0.0},
+            {"hidden_size": 0},
+        ):
+            with self.assertRaises(ValueError):
+                DeepseekV41HyperConnections(_tiny_hc_text_config(**overrides))
+
+
+
+class TestDeepseekV41RoutingRule(unittest.TestCase):
+    """Gate scoring and the noaux_tc selection rule (inference/model.py Gate)."""
+
+    def test_sqrtsoftplus_matches_the_official_recipe(self):
+        mx.random.seed(21)
+        logits = mx.random.normal((5, 8)) * 3.0
+        expected = mx.sqrt(mx.log(1.0 + mx.exp(logits.astype(mx.float32))))
+        got = routing_scores(logits, "sqrtsoftplus")
+        self.assertEqual(got.dtype, mx.float32)
+        self.assertTrue(mx.allclose(got, expected, atol=1e-5).item())
+        # Unbounded above and never normalized across experts: that is exactly
+        # why norm_topk_prob has work to do later.
+        self.assertFalse(mx.allclose(mx.sum(got, axis=-1), mx.ones((5,)), atol=1e-2).item())
+
+    def test_sqrtsoftplus_is_stable_in_both_tails(self):
+        logits = mx.array([[-200.0, 0.0, 200.0]], dtype=mx.float32)
+        got = routing_scores(logits, "sqrtsoftplus")
+        self.assertTrue(mx.all(mx.isfinite(got)).item())
+        self.assertTrue(mx.allclose(got[0, 2], mx.array(200.0 ** 0.5), atol=1e-2).item())
+
+    def test_softmax_and_sigmoid_scoring_are_also_supported(self):
+        mx.random.seed(22)
+        logits = mx.random.normal((4, 6))
+        soft = routing_scores(logits, "softmax")
+        self.assertTrue(mx.allclose(mx.sum(soft, axis=-1), mx.ones((4,)), atol=1e-6).item())
+        sig = routing_scores(logits, "sigmoid")
+        self.assertTrue(mx.allclose(sig, mx.sigmoid(logits.astype(mx.float32)), atol=1e-6).item())
+
+    def test_an_unknown_scoring_function_fails_closed(self):
+        with self.assertRaises(ValueError):
+            routing_scores(mx.zeros((1, 4)), "relu")
+
+    def test_topk_is_descending_and_breaks_ties_by_lowest_index(self):
+        # An all-equal score surface is exactly what a freshly initialized or
+        # zero gate produces, so tie behaviour is load-bearing, not academic.
+        tied = mx.array([[3.0, 1.0, 3.0, 2.0, 3.0]], dtype=mx.float32)
+        self.assertEqual(deterministic_topk_indices(tied, 3).tolist(), [[0, 2, 4]])
+        ranked = mx.array([[0.1, 0.9, 0.5, 0.4]], dtype=mx.float32)
+        self.assertEqual(deterministic_topk_indices(ranked, 3).tolist(), [[1, 2, 3]])
+        self.assertEqual(
+            sorted(deterministic_topk_indices(ranked, 4).tolist()[0]), [0, 1, 2, 3]
+        )
+
+    def test_topk_is_bit_identical_across_repeated_calls(self):
+        mx.random.seed(23)
+        scores = mx.random.normal((7, 16))
+        first = deterministic_topk_indices(scores, 6)
+        for _ in range(3):
+            self.assertTrue(mx.array_equal(deterministic_topk_indices(scores, 6), first).item())
+
+    def test_topk_out_of_range_fails_closed(self):
+        scores = mx.zeros((2, 4))
+        for k in (0, -1, 5):
+            with self.assertRaises(ValueError):
+                deterministic_topk_indices(scores, k)
+
+    def test_the_correction_bias_steers_selection_but_never_the_weights(self):
+        # The routing identity this whole rule exists for: the bias moves which
+        # experts run; the weight applied to an expert is its *unbiased* score.
+        scores = mx.array([[0.5, 0.4, 0.3, 0.2]], dtype=mx.float32)
+        no_bias = mx.zeros((4,), dtype=mx.float32)
+        bias = mx.array([0.0, 0.0, 0.0, 10.0], dtype=mx.float32)
+
+        unbiased_w, unbiased_i = noaux_tc_route(scores, no_bias, 2, True, 1.5)
+        biased_w, biased_i = noaux_tc_route(scores, bias, 2, True, 1.5)
+
+        self.assertEqual(unbiased_i.tolist(), [[0, 1]])
+        self.assertEqual(biased_i.tolist(), [[3, 0]])
+        # 0.2 and 0.5 are the *unbiased* scores of experts 3 and 0. A weight of
+        # 10.2 anywhere here would mean the bias had leaked into the scaling.
+        expected = mx.array([[0.2, 0.5]], dtype=mx.float32) / 0.7 * 1.5
+        self.assertTrue(mx.allclose(biased_w, expected, atol=1e-5).item())
+        self.assertTrue(mx.all(biased_w < 2.0).item())
+
+    def test_norm_topk_prob_normalizes_before_the_routed_scaling_factor(self):
+        scores = mx.array([[0.5, 0.4, 0.3, 0.2]], dtype=mx.float32)
+        zero = mx.zeros((4,), dtype=mx.float32)
+        normed, _ = noaux_tc_route(scores, zero, 3, True, 1.5)
+        self.assertTrue(mx.allclose(mx.sum(normed, axis=-1), mx.array([1.5]), atol=1e-5).item())
+        raw, _ = noaux_tc_route(scores, zero, 3, False, 2.0)
+        self.assertTrue(
+            mx.allclose(raw, mx.array([[1.0, 0.8, 0.6]], dtype=mx.float32), atol=1e-6).item()
+        )
+
+    def test_a_single_active_expert_is_never_renormalized_to_one(self):
+        # topk == 1 skips normalization upstream, so the lone weight keeps its
+        # raw score (times the routed scaling factor).
+        scores = mx.array([[0.25, 0.1]], dtype=mx.float32)
+        w, i = noaux_tc_route(scores, mx.zeros((2,), dtype=mx.float32), 1, True, 2.0)
+        self.assertEqual(i.tolist(), [[0]])
+        self.assertTrue(mx.allclose(w, mx.array([[0.5]], dtype=mx.float32), atol=1e-6).item())
+
+
+class TestDeepseekV41Gate(unittest.TestCase):
+    def test_official_config_gates_six_of_three_hundred_eighty_four(self):
+        config = _official_text_config()
+        gate = DeepseekV41Gate(config)
+        self.assertEqual(config.n_routed_experts, 384)
+        self.assertEqual(config.num_experts_per_tok, 6)
+        self.assertEqual(config.n_shared_experts, 1)
+        self.assertEqual(config.scoring_func, "sqrtsoftplus")
+        self.assertEqual(config.topk_method, "noaux_tc")
+        self.assertEqual(config.routed_scaling_factor, 1.5)
+        self.assertEqual(gate.weight.shape, (384, config.hidden_size))
+        self.assertEqual(gate.bias.shape, (384,))
+        self.assertEqual(gate.bias.dtype, mx.float32)
+        # Text-only by default: no VL routing bias is allocated.
+        self.assertNotIn("bias_vl", dict(gate.parameters()))
+
+        mx.random.seed(24)
+        gate.weight = mx.random.normal(gate.weight.shape) * 0.05
+        weights, indices = gate(mx.random.normal((2, config.hidden_size)))
+        self.assertEqual(indices.shape, (2, 6))
+        self.assertEqual(weights.shape, (2, 6))
+        for row in indices.tolist():
+            self.assertEqual(len(set(row)), 6)
+            self.assertTrue(all(0 <= e < 384 for e in row))
+        self.assertTrue(
+            mx.allclose(mx.sum(weights, axis=-1), mx.full((2,), 1.5), atol=1e-4).item()
+        )
+
+    def test_identical_logits_route_deterministically_to_the_lowest_indices(self):
+        config = _tiny_moe_text_config()
+        gate = DeepseekV41Gate(config)  # zero weight -> every expert ties
+        weights, indices = gate(mx.ones((3, config.hidden_size)))
+        self.assertEqual(indices.tolist(), [[0, 1, 2]] * 3)
+        # Equal scores, normalized: each selected expert gets scale / topk.
+        self.assertTrue(
+            mx.allclose(weights, mx.full((3, 3), 1.5 / 3.0), atol=1e-5).item()
+        )
+
+    def test_the_same_input_produces_bit_identical_routing(self):
+        mx.random.seed(25)
+        config = _tiny_moe_text_config()
+        gate = DeepseekV41Gate(config)
+        gate.weight = mx.random.normal(gate.weight.shape)
+        gate.bias = mx.random.normal(gate.bias.shape)
+        x = mx.random.normal((4, config.hidden_size))
+        w0, i0 = gate(x)
+        for _ in range(3):
+            w1, i1 = gate(x)
+            self.assertTrue(mx.array_equal(i1, i0).item())
+            self.assertTrue(mx.array_equal(w1, w0).item())
+
+    def test_the_vl_bias_only_applies_inside_image_spans(self):
+        config = _tiny_moe_text_config()
+        gate = DeepseekV41Gate(config, vision_enabled=True)
+        self.assertIn("bias_vl", dict(gate.parameters()))
+        gate.bias_vl = mx.concatenate(
+            [mx.zeros((7,), dtype=mx.float32), mx.array([10.0], dtype=mx.float32)]
+        )
+        x = mx.ones((2, config.hidden_size))
+        mask = mx.array([False, True])
+        _, indices = gate(x, mask)
+        self.assertEqual(indices.tolist()[0], [0, 1, 2])
+        self.assertEqual(indices.tolist()[1][0], 7)
+
+    def test_a_vl_mask_against_a_text_only_gate_fails_loud(self):
+        config = _tiny_moe_text_config()
+        gate = DeepseekV41Gate(config)
+        with self.assertRaises(ValueError):
+            gate(mx.ones((2, config.hidden_size)), mx.array([False, True]))
+
+    def test_shape_contracts_are_enforced(self):
+        config = _tiny_moe_text_config()
+        gate = DeepseekV41Gate(config)
+        with self.assertRaises(ValueError):
+            gate(mx.ones((2, config.hidden_size + 1)))
+        vl_gate = DeepseekV41Gate(config, vision_enabled=True)
+        with self.assertRaises(ValueError):
+            vl_gate(mx.ones((2, config.hidden_size)), mx.array([False, True, False]))
+
+    def test_malformed_routing_config_fails_closed(self):
+        for overrides in (
+            {"topk_method": "greedy"},
+            {"scoring_func": "relu"},
+            {"n_shared_experts": 2},
+            {"n_shared_experts": 0},
+            {"num_experts_per_tok": 0},
+            {"num_experts_per_tok": 9},
+            {"moe_intermediate_size": 0},
+            {"swiglu_limit": -1.0},
+        ):
+            with self.assertRaises(ValueError):
+                DeepseekV41Gate(_tiny_moe_text_config(**overrides))
+
+
+class TestDeepseekV41PackedExperts(unittest.TestCase):
+    """Packed-at-rest expert weights over the retained FP4/E8M0 primitives."""
+
+    def test_fp4_expert_weights_stay_packed_at_half_a_byte_per_element(self):
+        lin = DeepseekV41PackedLinear(64, 32, "fp4")
+        self.assertEqual(lin.weight.dtype, mx.uint8)
+        self.assertEqual(lin.weight.shape, (32, 32))  # 64 codes -> 32 bytes per row
+        self.assertEqual(lin.scale.dtype, mx.uint8)
+        self.assertEqual(lin.scale.shape, (32, 2))  # 64 / FP4_WEIGHT_BLOCK_SIZE
+        self.assertEqual(lin.weight.nbytes + lin.scale.nbytes, 32 * 32 + 32 * 2)
+
+    def test_fp8_weights_use_the_two_dimensional_thirty_two_tiled_scale_grid(self):
+        lin = DeepseekV41PackedLinear(64, 48, "fp8")
+        self.assertEqual(lin.weight.shape, (48, 64))
+        self.assertEqual(lin.scale.shape, (2, 2))  # ceil(48/32) x 64/32
+
+    def test_a_dense_linear_carries_no_scale_at_all(self):
+        lin = DeepseekV41PackedLinear(64, 32, None)
+        self.assertNotIn("scale", dict(lin.parameters()))
+        self.assertEqual(lin.weight.dtype, mx.bfloat16)
+
+    def test_dequantization_matches_the_retained_block_primitive(self):
+        mx.random.seed(31)
+        lin = _fill_packed(DeepseekV41PackedLinear(64, 32, "fp4"))
+        expected = dequantize_fp4_block(
+            lin.weight, lin.scale, FP4_WEIGHT_BLOCK_SIZE, mx.float32
+        )
+        self.assertTrue(mx.allclose(lin.dequantized(), expected, atol=0).item())
+        x = mx.random.normal((3, 64))
+        self.assertTrue(
+            mx.allclose(lin(x), x.astype(mx.float32) @ expected.T, atol=1e-4).item()
+        )
+
+    def test_a_forward_pass_never_persists_an_unpacked_weight(self):
+        # The whole reason the experts are stored packed: a persistent unpack
+        # would multiply routed-expert storage by 4x (FP4 -> float32).
+        mx.random.seed(32)
+        lin = _fill_packed(DeepseekV41PackedLinear(64, 32, "fp4"))
+        before = dict(lin.parameters())
+        mx.eval(lin(mx.random.normal((2, 64))))
+        after = dict(lin.parameters())
+        self.assertEqual(sorted(before), sorted(after))
+        self.assertEqual(after["weight"].dtype, mx.uint8)
+        self.assertEqual(after["weight"].shape, (32, 32))
+        self.assertNotIn("_dequantized", dict(lin))
+
+    def test_packed_shape_contracts_fail_closed(self):
+        for args in (
+            (33, 32, "fp4"),  # reduction dim not a multiple of the FP4 block
+            (33, 32, "fp8"),
+            (0, 32, "fp4"),
+            (32, 0, "fp4"),
+        ):
+            with self.assertRaises(ValueError):
+                DeepseekV41PackedLinear(*args)
+        with self.assertRaises(ValueError):
+            DeepseekV41PackedLinear(64, 32, "int4")
+        with self.assertRaises(ValueError):
+            DeepseekV41PackedLinear(64, 32, "fp4")(mx.zeros((2, 63)))
+
+    def test_swiglu_limit_clamps_the_up_branch_both_ways_and_the_gate_only_above(self):
+        def build(limit, gate_sign):
+            expert = DeepseekV41Expert(32, 64, None, swiglu_limit=limit)
+            expert.w1.weight = mx.full((64, 32), gate_sign * 10.0 / 32).astype(mx.bfloat16)
+            expert.w3.weight = mx.full((64, 32), -10.0 / 32).astype(mx.bfloat16)
+            expert.w2.weight = mx.full((32, 64), 1.0 / 64).astype(mx.bfloat16)
+            return expert
+
+        def silu(v):
+            return v * mx.sigmoid(v)
+
+        x = mx.ones((1, 32), dtype=mx.float32)
+
+        # gate = +10, up = -10, limit 1: gate clamped down to 1, up up to -1.
+        clamped = build(1.0, 1.0)(x)
+        self.assertTrue(mx.allclose(clamped, silu(mx.array(1.0)) * -1.0, atol=1e-3).item())
+
+        # Same weights, clamp disabled: both branches run wide open.
+        wide = build(0.0, 1.0)(x)
+        self.assertTrue(mx.allclose(wide, silu(mx.array(10.0)) * -10.0, atol=1e-2).item())
+        self.assertGreater(mx.abs(wide).max().item(), 50.0)
+
+        # gate = -10 with limit 1: the gate branch is clamped from above only,
+        # so it stays at -10 and silu drives the product to nearly zero. A
+        # symmetric clamp would leave a magnitude some 300x larger.
+        gate_negative = build(1.0, -1.0)(x)
+        self.assertTrue(
+            mx.allclose(gate_negative, silu(mx.array(-10.0)) * -1.0, atol=1e-4).item()
+        )
+        self.assertLess(mx.abs(gate_negative).max().item(), 1e-2)
+
+
+class TestDeepseekV41MoE(unittest.TestCase):
+    """384+1 MoE composition, exercised at a tiny but structurally exact size."""
+
+    def test_routed_and_shared_outputs_are_summed_per_token(self):
+        config, moe = _build_tiny_moe()
+        x = mx.random.normal((2, 3, config.hidden_size))
+        got = moe(x)
+        self.assertEqual(got.shape, x.shape)
+
+        flat = x.reshape(-1, config.hidden_size)
+        weights, indices = moe.gate(flat)
+        rows = indices.tolist()
+        rows_out = []
+        for token, row in enumerate(rows):
+            acc = mx.zeros((1, config.hidden_size), dtype=mx.float32)
+            for slot, expert_id in enumerate(row):
+                acc = acc + moe.experts[expert_id](
+                    flat[token : token + 1],
+                    weights[token : token + 1, slot : slot + 1],
+                ).astype(mx.float32)
+            rows_out.append(acc)
+        expected = mx.concatenate(rows_out, axis=0)
+        expected = expected + moe.shared_experts(flat).astype(mx.float32)
+        self.assertTrue(
+            mx.allclose(got.reshape(-1, config.hidden_size), expected, atol=1e-3).item()
+        )
+
+    def test_the_shared_expert_runs_for_every_token_including_unrouted_ones(self):
+        config, moe = _build_tiny_moe()
+        for expert in moe.experts:
+            _zero_expert(expert)
+        x = mx.random.normal((2, 3, config.hidden_size))
+        # Every routed expert decodes to exactly zero, so what is left is the
+        # shared expert -- which must still have run for all six tokens.
+        got = moe(x).reshape(-1, config.hidden_size)
+        shared = moe.shared_experts(x.reshape(-1, config.hidden_size)).astype(mx.float32)
+        self.assertTrue(mx.allclose(got, shared, atol=1e-4).item())
+        self.assertGreater(mx.max(mx.abs(got)).item(), 0.0)
+
+    def test_removing_the_shared_expert_leaves_only_the_routed_sum(self):
+        config, moe = _build_tiny_moe()
+        _zero_expert(moe.shared_experts)
+        x = mx.random.normal((1, 4, config.hidden_size))
+        got = moe(x).reshape(-1, config.hidden_size)
+        flat = x.reshape(-1, config.hidden_size)
+        weights, indices = moe.gate(flat)
+        rows_out = []
+        for token, row in enumerate(indices.tolist()):
+            acc = mx.zeros((1, config.hidden_size), dtype=mx.float32)
+            for slot, expert_id in enumerate(row):
+                acc = acc + moe.experts[expert_id](
+                    flat[token : token + 1],
+                    weights[token : token + 1, slot : slot + 1],
+                ).astype(mx.float32)
+            rows_out.append(acc)
+        expected = mx.concatenate(rows_out, axis=0)
+        self.assertTrue(mx.allclose(got, expected, atol=1e-3).item())
+
+    def test_exactly_the_routed_experts_are_unpacked_and_no_others(self):
+        import mlx_lm.models.deepseek_v41 as v41
+
+        config, moe = _build_tiny_moe()
+        x = mx.random.normal((1, 1, config.hidden_size))
+        _, indices = moe.gate(x.reshape(-1, config.hidden_size))
+        routed = set(indices.tolist()[0])
+        self.assertEqual(len(routed), 3)
+        self.assertLess(len(routed), config.n_routed_experts)
+
+        calls = []
+        real = v41.dequantize_fp4_block
+
+        def counting(packed, scale, *a, **k):
+            calls.append(packed.shape)
+            return real(packed, scale, *a, **k)
+
+        v41.dequantize_fp4_block = counting
+        try:
+            mx.eval(moe(x))
+        finally:
+            v41.dequantize_fp4_block = real
+        # Three w1/w2/w3 unpacks per routed expert, and nothing for the five
+        # experts this token did not select.
+        self.assertEqual(len(calls), 3 * len(routed))
+
+    def test_experts_are_still_packed_after_a_forward_pass(self):
+        config, moe = _build_tiny_moe()
+        mx.eval(moe(mx.random.normal((1, 2, config.hidden_size))))
+        for expert in moe.experts:
+            self.assertEqual(expert.w1.weight.dtype, mx.uint8)
+            self.assertEqual(expert.w1.weight.shape, (config.moe_intermediate_size, config.hidden_size // 2))
+            self.assertEqual(expert.w2.weight.dtype, mx.uint8)
+            self.assertEqual(expert.w3.scale.dtype, mx.uint8)
+
+    def test_expert_and_gate_parameter_names_match_the_checkpoint_contract(self):
+        _, moe = _build_tiny_moe()
+        names = {k for k, _ in tree_flatten(moe.parameters())}
+        for expected in (
+            "gate.weight",
+            "gate.bias",
+            "experts.0.w1.weight",
+            "experts.0.w1.scale",
+            "experts.0.w2.weight",
+            "experts.0.w3.weight",
+            "shared_experts.w1.weight",
+            "shared_experts.w1.scale",
+            "shared_experts.w2.weight",
+            "shared_experts.w3.weight",
+        ):
+            self.assertIn(expected, names)
+
+    def test_a_single_token_decode_and_a_batch_agree_per_token(self):
+        config, moe = _build_tiny_moe()
+        x = mx.random.normal((1, 3, config.hidden_size))
+        batched = moe(x)
+        for token in range(3):
+            single = moe(x[:, token : token + 1])
+            self.assertTrue(
+                mx.allclose(single[0, 0], batched[0, token], atol=1e-3).item()
+            )
+
+    def test_shape_contract_is_enforced(self):
+        config, moe = _build_tiny_moe()
+        with self.assertRaises(ValueError):
+            moe(mx.zeros((2, config.hidden_size + 1)))
+
+
+class TestDeepseekV41ExpertPartition(unittest.TestCase):
+    """World-size expert sharding. Pure arithmetic at the official 384 count --
+    nothing here allocates an official-sized expert.
+    """
+
+    def test_the_official_expert_count_splits_evenly_over_real_world_sizes(self):
+        self.assertEqual(routed_expert_partition(384, 1, 0), (0, 384))
+        self.assertEqual(routed_expert_partition(384, 2, 1), (192, 384))
+        self.assertEqual(routed_expert_partition(384, 4, 2), (192, 288))
+        self.assertEqual(routed_expert_partition(384, 8, 0), (0, 48))
+        # The DSpark gate routes 128, which shards over the same world sizes.
+        self.assertEqual(routed_expert_partition(128, 4, 3), (96, 128))
+
+    def test_every_expert_is_owned_by_exactly_one_rank(self):
+        for world_size in (1, 2, 3, 4, 6, 8, 12, 16):
+            covered = []
+            for rank in range(world_size):
+                start, end = routed_expert_partition(384, world_size, rank)
+                covered.extend(range(start, end))
+            self.assertEqual(covered, list(range(384)), world_size)
+
+    def test_an_uneven_split_is_refused_rather_than_leaving_experts_unowned(self):
+        for world_size in (5, 7, 9, 10):
+            with self.assertRaises(ValueError):
+                routed_expert_partition(384, world_size, 0)
+
+    def test_degenerate_partition_arguments_fail_closed(self):
+        for args in ((384, 0, 0), (384, -1, 0), (384, 4, 4), (384, 4, -1), (0, 1, 0)):
+            with self.assertRaises(ValueError):
+                routed_expert_partition(*args)
+
+    def test_a_rank_constructs_only_the_experts_it_owns(self):
+        config = _tiny_moe_text_config()
+        moe = DeepseekV41MoE(config, world_size=4, rank=1)
+        self.assertEqual(moe.local_expert_ids, [2, 3])
+        self.assertEqual(moe.n_local_experts, 2)
+        self.assertEqual(len(moe.experts), 2)
+        # Global ids, not rank-local ones.
+        self.assertIs(moe.expert(3), moe.experts[1])
+        with self.assertRaises(KeyError):
+            moe.expert(0)
+        with self.assertRaises(KeyError):
+            moe.expert(4)
+
+    def test_the_gate_is_replicated_across_ranks_while_experts_are_not(self):
+        config = _tiny_moe_text_config()
+        for rank in range(4):
+            moe = DeepseekV41MoE(config, world_size=4, rank=rank)
+            self.assertEqual(moe.gate.weight.shape, (8, config.hidden_size))
+            self.assertEqual(moe.gate.n_routed_experts, 8)
+            self.assertEqual(len(moe.experts), 2)
+            # Every rank runs the shared expert; only the routed set is split.
+            self.assertEqual(
+                moe.shared_experts.w1.weight.shape,
+                (config.moe_intermediate_size, config.hidden_size),
+            )
+
+    def test_executing_a_sharded_moe_fails_loud_instead_of_silently_partial(self):
+        config = _tiny_moe_text_config()
+        moe = DeepseekV41MoE(config, world_size=2, rank=0)
+        with self.assertRaises(NotImplementedError):
+            moe(mx.zeros((1, 2, config.hidden_size)))
+
+    def test_a_world_size_that_does_not_divide_the_experts_fails_at_construction(self):
+        with self.assertRaises(ValueError):
+            DeepseekV41MoE(_tiny_moe_text_config(), world_size=3, rank=0)
+
+
+class TestDeepseekV41RoutingConfigValidation(unittest.TestCase):
+    """validate_moe_routing_config is the single fail-closed gate every MoE
+    surface routes through, so it is checked directly as well as via the
+    modules that call it.
+    """
+
+    def test_the_official_routing_config_validates(self):
+        config = _official_text_config()
+        validate_moe_routing_config(config, config.n_routed_experts, config.num_experts_per_tok)
+        # The DSpark gate reuses the same rule with its own expert counts.
+        validate_moe_routing_config(config, 128, 3)
+
+    def test_a_topk_wider_than_the_expert_pool_is_rejected(self):
+        config = _tiny_moe_text_config()
+        validate_moe_routing_config(config, 8, 8)
+        with self.assertRaises(ValueError):
+            validate_moe_routing_config(config, 8, 9)
+        with self.assertRaises(ValueError):
+            validate_moe_routing_config(config, 0, 1)
+
+    def test_unsupported_routing_variants_are_named_in_the_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            validate_moe_routing_config(_tiny_moe_text_config(topk_method="group_limited_greedy"), 8, 3)
+        self.assertIn("noaux_tc", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            validate_moe_routing_config(_tiny_moe_text_config(scoring_func="gelu"), 8, 3)
+        self.assertIn("sqrtsoftplus", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            validate_moe_routing_config(_tiny_moe_text_config(n_shared_experts=3), 8, 3)
+        self.assertIn("shared", str(ctx.exception).lower())
+
 
 if __name__ == "__main__":
     unittest.main()

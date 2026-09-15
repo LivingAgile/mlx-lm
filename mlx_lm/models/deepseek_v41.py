@@ -35,10 +35,27 @@ architecture (Plan 0051 M2). It provides:
     ``make_deepseek_v41_attention_caches``). These are directly
     constructible and executable today, independently of ``Model``.
 
+  * The exact Hyper-Connections residual stream (``hc_mult == 4`` parallel
+    copies): ``hc_split_sinkhorn`` with the official asymmetric
+    softmax/column/row normalization order, ``hc_pre``/``hc_post``, the
+    identity pre-mix, and ``DeepseekV41HyperConnections`` which encodes the
+    ordering of ``Block.forward`` in which a sublayer's own coefficients are
+    consumed by the *next* sublayer, never by itself.
+  * The exact MoE: ``sqrtsoftplus`` scoring, ``noaux_tc`` bias-steered
+    selection with deterministic ties, ``norm_topk_prob`` normalization and
+    ``routed_scaling_factor``, 384 routed experts with 6 active per token
+    plus exactly one shared expert, over packed-at-rest FP4/FP8 experts
+    (``DeepseekV41PackedLinear``) that are decoded only for the experts a
+    token actually routes to, and only for the duration of that call
+    (``DeepseekV41Gate``, ``DeepseekV41Expert``, ``DeepseekV41MoE``).
+    ``routed_expert_partition`` resolves the per-rank expert split; the
+    cross-rank all-reduce that would combine those partial sums is not
+    implemented, and executing at ``world_size > 1`` fails loud.
+
 Explicitly out of scope for this slice (tracked as later M2/M3 work, not
-faked here): the Hyper-Connections Sinkhorn split/merge that stitches the
-attention layers into a residual stream, 384+1 MoE routing, sparse Engram
-gather, vision/aligner token-budget arithmetic, and DSpark/MTP. ``Model``
+faked here): the Block/Transformer glue that would wire the attention stack,
+the Hyper-Connections and the MoE into one backbone, sparse Engram gather,
+vision/aligner token-budget arithmetic, and DSpark/MTP. ``Model``
 is registered (``model_type == "deepseek_v41"``, not a ``deepseek_v4`` alias)
 so config validation and packed-weight loading are exercisable now, but
 ``Model.__call__`` raises ``NotImplementedError`` naming the deferred pieces
@@ -1861,6 +1878,847 @@ class DeepseekV41AttentionStack(nn.Module):
             layer(h, c) for layer, h, c in zip(self.layers, hidden_states, cache)
         ]
 
+
+# --------------------------------------------------------------------------- #
+# Hyper-Connections (hc_mult parallel residual streams)                        #
+#                                                                              #
+# Exact port of inference/model.py Block.hc_mixes / hc_pre / hc_post /         #
+# Block.forward and inference/kernel.py hc_split_sinkhorn at the pinned        #
+# revision deepseek-ai/DeepSeek-V4.1-Flash@dba1be0a40aa45a94ad051997016db39    #
+# 60a90277, plus Transformer.forward hc_mult expansion and                     #
+# make_identity_pre_mix. Grounded in Plan 0051                                 #
+# artifacts/m1-architecture-trace.md Sections 9 and 12 item 4.                 #
+#                                                                              #
+# hc_split_sinkhorn is a TileLang CUDA/HIP kernel upstream with no Metal or    #
+# MLX equivalent; what follows is the same arithmetic in plain MLX ops, in     #
+# float32 throughout as the kernel is, including the exact (and deliberately   #
+# asymmetric) normalization order: a row softmax plus eps, then one column     #
+# normalization, then sinkhorn_iters - 1 further row/column passes. It is      #
+# numerically equivalent, not fused.                                           #
+# --------------------------------------------------------------------------- #
+
+
+def hc_split_sinkhorn(
+    mixes: mx.array,
+    hc_scale: mx.array,
+    hc_base: mx.array,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+) -> Tuple[mx.array, mx.array, mx.array]:
+    """Split one projection of the residual stream into the three Hyper-Connection
+    coefficient sets, exactly as inference/kernel.py hc_split_sinkhorn_kernel does.
+
+    ``mixes`` is ``[..., (2 + hc_mult) * hc_mult]``, laid out as three
+    contiguous segments in this order (the kernel indexes them literally):
+
+      * ``[0, hc)``          -> ``pre``  = ``sigmoid(m * hc_scale[0] + hc_base) + eps``
+      * ``[hc, 2*hc)``       -> ``post`` = ``2 * sigmoid(m * hc_scale[1] + hc_base)``
+      * ``[2*hc, 2*hc+hc^2)`` -> ``comb`` logits, read row-major as ``[j * hc + k]``
+
+    ``comb`` is then made (approximately) doubly stochastic by Sinkhorn:
+    one row softmax with ``+ eps``, one column normalization, then
+    ``sinkhorn_iters - 1`` further row-then-column passes -- so the very
+    first row pass is a softmax rather than a plain sum normalization, and
+    the sequence ends on a column pass. Reproducing that asymmetry matters:
+    a symmetric loop converges to a different fixed point at finite
+    iteration counts.
+
+    Returns ``(pre, post, comb)`` with shapes ``[..., hc]``, ``[..., hc]``
+    and ``[..., hc, hc]``, all float32.
+    """
+    if hc_mult < 1:
+        raise ValueError(f"hc_mult must be positive, got {hc_mult}")
+    if sinkhorn_iters < 1:
+        raise ValueError(
+            f"hc_sinkhorn_iters must be at least 1, got {sinkhorn_iters}: the "
+            "kernel always runs one softmax-plus-column pass and then "
+            "sinkhorn_iters - 1 more"
+        )
+    if not eps > 0:
+        raise ValueError(
+            f"hc_eps must be positive, got {eps}: it is both the pre-mix floor "
+            "and the Sinkhorn division guard"
+        )
+    mix_hc = (2 + hc_mult) * hc_mult
+    if mixes.ndim < 1 or mixes.shape[-1] != mix_hc:
+        raise ValueError(
+            f"mixes last dimension must be (2 + hc_mult) * hc_mult = {mix_hc} "
+            f"for hc_mult={hc_mult}, got shape {mixes.shape}"
+        )
+    if tuple(hc_scale.shape) != (3,):
+        raise ValueError(
+            f"hc_scale must have exactly 3 entries (pre/post/comb), got shape "
+            f"{hc_scale.shape}"
+        )
+    if tuple(hc_base.shape) != (mix_hc,):
+        raise ValueError(
+            f"hc_base must have one entry per mix channel ({mix_hc}), got shape "
+            f"{hc_base.shape}"
+        )
+
+    m = mixes.astype(mx.float32)
+    scale = hc_scale.astype(mx.float32)
+    base = hc_base.astype(mx.float32)
+    hc = hc_mult
+
+    pre = mx.sigmoid(m[..., :hc] * scale[0] + base[:hc]) + eps
+    post = 2.0 * mx.sigmoid(m[..., hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
+
+    comb = m[..., 2 * hc :] * scale[2] + base[2 * hc :]
+    comb = comb.reshape(*comb.shape[:-1], hc, hc)
+
+    comb = mx.softmax(comb, axis=-1) + eps
+    comb = comb / (mx.sum(comb, axis=-2, keepdims=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (mx.sum(comb, axis=-1, keepdims=True) + eps)
+        comb = comb / (mx.sum(comb, axis=-2, keepdims=True) + eps)
+    return pre, post, comb
+
+
+def expand_hyper_connection_stream(h: mx.array, hc_mult: int) -> mx.array:
+    """Expand ``[b, s, d]`` token embeddings into the ``[b, s, hc, d]`` residual
+    stream the backbone actually carries (Transformer.forward's
+    ``h.unsqueeze(2).repeat(1, 1, hc_mult, 1)``): every copy starts identical.
+    """
+    if hc_mult < 1:
+        raise ValueError(f"hc_mult must be positive, got {hc_mult}")
+    if h.ndim != 3:
+        raise ValueError(
+            f"expected [batch, seqlen, dim] token embeddings, got shape {h.shape}"
+        )
+    return mx.repeat(mx.expand_dims(h, 2), hc_mult, axis=2)
+
+
+def make_identity_pre_mix(batch: int, seqlen: int, hc_mult: int) -> mx.array:
+    """The initial one-hot pre-mix (inference/model.py make_identity_pre_mix).
+
+    The first block collapses the expanded stream by selecting copy 0 only,
+    which -- because every copy starts identical -- makes the first sublayer
+    input exactly the token embedding.
+    """
+    if hc_mult < 1:
+        raise ValueError(f"hc_mult must be positive, got {hc_mult}")
+    if batch < 1 or seqlen < 1:
+        raise ValueError(f"batch and seqlen must be positive, got {batch}, {seqlen}")
+    one_hot = (mx.arange(hc_mult, dtype=mx.int32) == 0).astype(mx.float32)
+    return mx.broadcast_to(one_hot, (batch, seqlen, hc_mult))
+
+
+def hc_pre(x: mx.array, pre_mix: mx.array) -> mx.array:
+    """Collapse the hc copies into one sublayer input: ``[b,s,hc,d]`` x ``[b,s,hc]``
+    -> ``[b,s,d]``, weighted-summed in float32 and cast back (Block.hc_pre).
+    """
+    if x.ndim < 3:
+        raise ValueError(f"expected a [..., hc, dim] stream, got shape {x.shape}")
+    if tuple(pre_mix.shape) != tuple(x.shape[:-1]):
+        raise ValueError(
+            f"pre_mix shape {pre_mix.shape} does not match the stream's "
+            f"[..., hc] axes {tuple(x.shape[:-1])}"
+        )
+    y = mx.sum(mx.expand_dims(pre_mix.astype(mx.float32), -1) * x.astype(mx.float32), axis=-2)
+    return y.astype(x.dtype)
+
+
+def hc_post(
+    x: mx.array, residual: mx.array, post_mix: mx.array, comb: mx.array
+) -> mx.array:
+    """Expand a sublayer output back to hc copies and mix the residual stream in
+    through ``comb`` (Block.hc_post).
+
+    ``x``: ``[b,s,d]``, ``residual``: ``[b,s,hc,d]``, ``post_mix``: ``[b,s,hc]``,
+    ``comb``: ``[b,s,hc,hc]`` -> ``[b,s,hc,d]``. Note ``comb`` is summed over its
+    *first* (source-copy) axis, so ``comb[.., j, k]`` sends residual copy ``j``
+    into output copy ``k`` -- the transposed reading silently produces a
+    plausible-looking but wrong stream, which is why this is spelled out.
+    """
+    if residual.ndim < 3:
+        raise ValueError(f"expected a [..., hc, dim] residual, got {residual.shape}")
+    hc = residual.shape[-2]
+    if tuple(x.shape) != tuple(residual.shape[:-2]) + (residual.shape[-1],):
+        raise ValueError(
+            f"sublayer output shape {x.shape} does not match the residual "
+            f"stream {residual.shape} with its hc axis collapsed"
+        )
+    if tuple(post_mix.shape) != tuple(residual.shape[:-1]):
+        raise ValueError(
+            f"post_mix shape {post_mix.shape} does not match [..., hc] "
+            f"{tuple(residual.shape[:-1])}"
+        )
+    if tuple(comb.shape) != tuple(residual.shape[:-1]) + (hc,):
+        raise ValueError(
+            f"comb shape {comb.shape} does not match [..., hc, hc] "
+            f"{tuple(residual.shape[:-1]) + (hc,)}"
+        )
+    broadcast = mx.expand_dims(post_mix.astype(mx.float32), -1) * mx.expand_dims(
+        x.astype(mx.float32), -2
+    )
+    mixed = mx.sum(
+        mx.expand_dims(comb.astype(mx.float32), -1)
+        * mx.expand_dims(residual.astype(mx.float32), -2),
+        axis=-3,
+    )
+    return (broadcast + mixed).astype(x.dtype)
+
+
+class DeepseekV41HyperConnections(nn.Module):
+    """The six per-block Hyper-Connection parameters and the residual-stream
+    semantics built on them (inference/model.py Block).
+
+    Parameter names are the checkpoint's own flat Block-level names
+    (``hc_attn_fn`` / ``hc_ffn_fn`` ``[mix_hc, hc_mult * dim]``,
+    ``hc_attn_base`` / ``hc_ffn_base`` ``[mix_hc]``, ``hc_attn_scale`` /
+    ``hc_ffn_scale`` ``[3]``, all float32), so a Block that composes this
+    module has to flatten one level of nesting when it maps checkpoint keys.
+
+    The load-bearing ordering subtlety, spelled out because it is easy to get
+    backwards: each sublayer's own ``hc_mixes`` produces the ``pre`` mix used
+    by the *next* sublayer, never by itself. Attention consumes the pre-mix the
+    previous block's FFN produced; the FFN consumes the one this block's
+    attention produced; and the block hands its FFN's pre-mix onward. That is
+    encoded once, in ``block_step``, rather than left to each caller.
+    """
+
+    def __init__(self, config: TextConfig):
+        super().__init__()
+        if config.hc_mult < 1:
+            raise ValueError(
+                f"text_config.hc_mult must be positive, got {config.hc_mult}"
+            )
+        if config.hc_sinkhorn_iters < 1:
+            raise ValueError(
+                "text_config.hc_sinkhorn_iters must be at least 1, got "
+                f"{config.hc_sinkhorn_iters}"
+            )
+        if not config.hc_eps > 0:
+            raise ValueError(
+                f"text_config.hc_eps must be positive, got {config.hc_eps}"
+            )
+        if config.hidden_size < 1:
+            raise ValueError(
+                f"text_config.hidden_size must be positive, got {config.hidden_size}"
+            )
+        self.dim = config.hidden_size
+        self.hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        self.norm_eps = config.rms_norm_eps
+
+        mix_hc = (2 + self.hc_mult) * self.hc_mult
+        hc_dim = self.hc_mult * self.dim
+        self.hc_attn_fn = mx.zeros((mix_hc, hc_dim), dtype=mx.float32)
+        self.hc_ffn_fn = mx.zeros((mix_hc, hc_dim), dtype=mx.float32)
+        self.hc_attn_base = mx.zeros((mix_hc,), dtype=mx.float32)
+        self.hc_ffn_base = mx.zeros((mix_hc,), dtype=mx.float32)
+        self.hc_attn_scale = mx.zeros((3,), dtype=mx.float32)
+        self.hc_ffn_scale = mx.zeros((3,), dtype=mx.float32)
+
+    def _mixes(self, x, hc_fn, hc_scale, hc_base):
+        if x.ndim < 3 or x.shape[-2] != self.hc_mult or x.shape[-1] != self.dim:
+            raise ValueError(
+                f"expected a [..., hc_mult={self.hc_mult}, dim={self.dim}] residual "
+                f"stream, got shape {x.shape}"
+            )
+        flat = x.reshape(*x.shape[:-2], self.hc_mult * self.dim).astype(mx.float32)
+        # One RMS statistic per token over the whole flattened hc*d stream,
+        # applied after the projection (Block.hc_mixes).
+        rsqrt = mx.rsqrt(mx.mean(flat * flat, axis=-1, keepdims=True) + self.norm_eps)
+        mixes = (flat @ hc_fn.astype(mx.float32).T) * rsqrt
+        return hc_split_sinkhorn(
+            mixes,
+            hc_scale,
+            hc_base,
+            self.hc_mult,
+            self.hc_sinkhorn_iters,
+            self.hc_eps,
+        )
+
+    def attn_mixes(self, x: mx.array):
+        return self._mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+
+    def ffn_mixes(self, x: mx.array):
+        return self._mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+
+    def sublayer_step(self, x: mx.array, pre_mix: mx.array, sublayer, which: str):
+        """Run one sublayer inside the hc residual stream.
+
+        Returns ``(stream, next_pre_mix)``: the coefficients derived here are
+        the ones the *next* sublayer collapses with, while this sublayer's
+        input is collapsed with the ``pre_mix`` handed in.
+        """
+        if which == "attn":
+            mixes = self.attn_mixes
+        elif which == "ffn":
+            mixes = self.ffn_mixes
+        else:
+            raise ValueError(
+                f"which must be 'attn' or 'ffn', got {which!r}: a block has "
+                "exactly those two Hyper-Connection coefficient sets"
+            )
+        residual = x
+        next_pre_mix, post_mix, comb = mixes(x)
+        out = sublayer(hc_pre(x, pre_mix))
+        return hc_post(out, residual, post_mix, comb), next_pre_mix
+
+    def block_step(self, x: mx.array, pre_mix: mx.array, attn, ffn):
+        """One full block's residual-stream traversal (Block.forward), returning
+        ``(stream, next_pre_mix)`` where ``next_pre_mix`` is the FFN's.
+        """
+        x, attn_pre = self.sublayer_step(x, pre_mix, attn, "attn")
+        return self.sublayer_step(x, attn_pre, ffn, "ffn")
+
+
+# --------------------------------------------------------------------------- #
+# MoE: 384 routed + 1 shared expert, noaux_tc / sqrtsoftplus routing           #
+#                                                                              #
+# Exact port of inference/model.py Gate / Expert / MoE at the pinned revision  #
+# deepseek-ai/DeepSeek-V4.1-Flash@dba1be0a40aa45a94ad051997016db3960a90277,    #
+# consuming the packed FP4(E2M1)/E8M0 and FP8(E4M3)/E8M0 primitives above.     #
+# Grounded in Plan 0051 artifacts/m1-architecture-trace.md Section 9.          #
+#                                                                              #
+# The pinned text_config routes 6 of 384 experts per token plus exactly one    #
+# shared expert every token goes through, scores with sqrtsoftplus, selects    #
+# with noaux_tc (a correction bias steers *selection* only; the routing        #
+# weights come from the unbiased scores), normalizes the selected weights and  #
+# then scales them by routed_scaling_factor = 1.5.                             #
+#                                                                              #
+# Storage: routed experts are FP4-packed with an E8M0 block scale and the      #
+# shared expert is FP8-block-quantized. Both are dequantized transiently,      #
+# inside the GEMM call that needs them, and never persistently promoted --     #
+# the whole point of DeepseekV41PackedLinear. wo_a (elsewhere in this module)  #
+# is the single declared exception to that rule.                               #
+# --------------------------------------------------------------------------- #
+
+# Weight-side block sizes: quantization_config.weight_block_size is [32, 32]
+# (2-D tiled, FP8 path) and inference/kernel.py fp4_gemm quantizes FP4 weights
+# 1x32 along the K/reduction axis with an E8M0 scale.
+FP4_WEIGHT_BLOCK_SIZE = 32
+FP8_WEIGHT_BLOCK_SIZE = 32
+
+# inference/model.py ModelArgs.gate_temp. Neither the pinned HF config.json
+# text_config nor inference/config.json carries this key, so the released model
+# uses the reference default and the division below is an identity; it is kept
+# explicit rather than dropped so a future config that does set it has an
+# obvious home.
+GATE_TEMP = 1.0
+
+# Gate.forward: "not norm_eps, matches training".
+ROUTING_NORM_EPS = 1e-20
+
+SUPPORTED_SCORING_FUNCS = ("softmax", "sigmoid", "sqrtsoftplus")
+NOAUX_TC = "noaux_tc"
+
+
+def routing_scores(logits: mx.array, scoring_func: str) -> mx.array:
+    """Map raw gate logits to routing scores in float32 (Gate.forward).
+
+    The pinned config uses ``sqrtsoftplus``: ``sqrt(softplus(logits))``, which
+    is unbounded above (unlike sigmoid) and not normalized across experts
+    (unlike softmax), so the later top-k normalization is what makes the
+    selected weights sum to one.
+    """
+    x = logits.astype(mx.float32)
+    if scoring_func == "softmax":
+        return mx.softmax(x, axis=-1)
+    if scoring_func == "sigmoid":
+        return mx.sigmoid(x)
+    if scoring_func == "sqrtsoftplus":
+        # log1p(exp(x)) via logaddexp, which is stable in both tails where a
+        # literal log(1 + exp(x)) overflows or cancels.
+        return mx.sqrt(mx.logaddexp(x, mx.zeros_like(x)))
+    raise ValueError(
+        f"unsupported scoring_func {scoring_func!r}; inference/model.py Gate "
+        f"implements exactly {SUPPORTED_SCORING_FUNCS}"
+    )
+
+
+def deterministic_topk_indices(scores: mx.array, k: int) -> mx.array:
+    """Top-k indices along the last axis, descending, ties broken by lowest index.
+
+    ``torch.topk`` (which Gate.forward uses) is deterministic in both respects,
+    so routing must be too: on the flat score surfaces this gate produces --
+    an all-zero gate weight makes every expert score identical -- an
+    order-unspecified partition would silently pick a different expert set per
+    run and per backend. ``mx.argpartition`` gives no such guarantee, so the
+    selection is built from ``max`` plus a lowest-matching-index ``min``, which
+    is exact by construction and needs no assumption about sort stability.
+
+    ``k`` is small here (6 routed experts per token in the pinned config, 3 for
+    the DSpark gate), so the k sequential passes are cheap.
+    """
+    if scores.ndim < 1:
+        raise ValueError(f"expected at least a 1-D score array, got {scores.shape}")
+    n = scores.shape[-1]
+    if not 1 <= k <= n:
+        raise ValueError(
+            f"top-k k={k} is out of range for {n} candidates along the last axis"
+        )
+    positions = mx.arange(n, dtype=mx.int32)
+    remaining = scores.astype(mx.float32)
+    neg_inf = mx.array(-float("inf"), dtype=mx.float32)
+    chosen = []
+    for _ in range(k):
+        best = mx.max(remaining, axis=-1, keepdims=True)
+        # Lowest index attaining the max; n is an unreachable sentinel that a
+        # non-empty row can never select.
+        idx = mx.min(
+            mx.where(remaining == best, positions, mx.array(n, dtype=mx.int32)),
+            axis=-1,
+            keepdims=True,
+        )
+        chosen.append(idx)
+        remaining = mx.where(positions == idx, neg_inf, remaining)
+    return mx.concatenate(chosen, axis=-1).astype(mx.int32)
+
+
+def noaux_tc_route(
+    scores: mx.array,
+    bias: mx.array,
+    topk: int,
+    norm_topk_prob: bool,
+    routed_scaling_factor: float,
+) -> Tuple[mx.array, mx.array]:
+    """The noaux_tc selection rule (Gate.forward).
+
+    The correction bias steers which experts are picked and nothing else: the
+    returned weights are gathered from the *unbiased* scores. Getting this
+    backwards -- scaling by the biased score -- is numerically plausible and
+    architecturally wrong, so it is asserted directly in the tests.
+    """
+    if topk < 1:
+        raise ValueError(f"num_experts_per_tok must be positive, got {topk}")
+    indices = deterministic_topk_indices(scores + bias, topk)
+    weights = mx.take_along_axis(scores.astype(mx.float32), indices, axis=-1)
+    if norm_topk_prob and topk > 1:
+        weights = weights / (
+            mx.sum(weights, axis=-1, keepdims=True) + ROUTING_NORM_EPS
+        )
+    return weights * routed_scaling_factor, indices
+
+
+def routed_expert_partition(
+    n_routed_experts: int, world_size: int = 1, rank: int = 0
+) -> Tuple[int, int]:
+    """The half-open ``[start, end)`` routed-expert range one rank owns.
+
+    Mirrors inference/model.py MoE.__init__: the routed experts are split into
+    ``world_size`` equal contiguous blocks, so the count must divide exactly --
+    an uneven split is refused rather than silently leaving some experts
+    unowned (every token that routed to one would then contribute nothing and
+    quietly degrade output instead of failing). 384 admits world sizes
+    1/2/3/4/6/8/12/16/24/32/48/64/96/128/192/384; 5 and 7 do not.
+    """
+    if n_routed_experts < 1:
+        raise ValueError(
+            f"n_routed_experts must be positive, got {n_routed_experts}"
+        )
+    if world_size < 1:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(
+            f"rank {rank} is outside the range [0, world_size={world_size})"
+        )
+    if n_routed_experts % world_size:
+        raise ValueError(
+            f"number of experts ({n_routed_experts}) must be divisible by world "
+            f"size ({world_size})"
+        )
+    n_local = n_routed_experts // world_size
+    start = rank * n_local
+    return start, start + n_local
+
+
+def validate_moe_routing_config(
+    config: TextConfig, n_routed_experts: int, n_activated_experts: int
+) -> None:
+    """Fail closed on every routing config the official Gate/MoE cannot express."""
+    if config.topk_method != NOAUX_TC:
+        raise ValueError(
+            f"text_config.topk_method must be {NOAUX_TC!r}, got "
+            f"{config.topk_method!r}: inference/model.py Gate implements only the "
+            "bias-corrected selection rule, with no auxiliary-loss or "
+            "group-limited variant"
+        )
+    if config.scoring_func not in SUPPORTED_SCORING_FUNCS:
+        raise ValueError(
+            f"text_config.scoring_func must be one of {SUPPORTED_SCORING_FUNCS}, "
+            f"got {config.scoring_func!r}"
+        )
+    if config.n_shared_experts != 1:
+        raise ValueError(
+            "text_config.n_shared_experts must be exactly 1, got "
+            f"{config.n_shared_experts}: inference/model.py MoE asserts this "
+            "directly and builds a single, unrouted shared Expert per layer"
+        )
+    if n_routed_experts < 1:
+        raise ValueError(
+            f"n_routed_experts must be positive, got {n_routed_experts}"
+        )
+    if not 1 <= n_activated_experts <= n_routed_experts:
+        raise ValueError(
+            f"num_experts_per_tok={n_activated_experts} is outside "
+            f"[1, n_routed_experts={n_routed_experts}]"
+        )
+    if config.hidden_size < 1 or config.moe_intermediate_size < 1:
+        raise ValueError(
+            f"hidden_size={config.hidden_size} and "
+            f"moe_intermediate_size={config.moe_intermediate_size} must both be "
+            "positive"
+        )
+    if config.swiglu_limit < 0:
+        raise ValueError(
+            f"text_config.swiglu_limit must be non-negative, got "
+            f"{config.swiglu_limit} (0 disables the clamp)"
+        )
+
+
+class DeepseekV41PackedLinear(nn.Module):
+    """A bias-free Linear whose weight stays packed at rest.
+
+    ``quant="fp4"`` stores ``[out, in // 2]`` uint8 (two E2M1 codes per byte)
+    plus an ``[out, in // 32]`` E8M0 scale; ``quant="fp8"`` stores ``[out, in]``
+    uint8 E4M3 plus a 2-D-tiled ``[ceil(out/32), in // 32]`` E8M0 scale;
+    ``quant=None`` is a plain dense weight.
+
+    The packed bytes are decoded inside ``__call__`` and the decoded tensor is
+    deliberately not retained anywhere: with 384 routed experts per layer,
+    persistently unpacking them would multiply expert storage by 4x (FP4) and
+    defeat the entire at-rest format. Only the experts a token actually routes
+    to are ever decoded, and only for the duration of that call.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        quant: Optional[str] = "fp4",
+        dtype=mx.bfloat16,
+    ):
+        super().__init__()
+        if in_features < 1 or out_features < 1:
+            raise ValueError(
+                f"in_features={in_features} and out_features={out_features} must "
+                "both be positive"
+            )
+        self.in_features = in_features
+        self.out_features = out_features
+        self.quant = quant
+        if quant == "fp4":
+            if in_features % FP4_WEIGHT_BLOCK_SIZE:
+                raise ValueError(
+                    f"in_features={in_features} is not divisible by the FP4 weight "
+                    f"block size {FP4_WEIGHT_BLOCK_SIZE}; fp4_gemm quantizes 1x32 "
+                    "along the reduction axis and never pads a partial tail"
+                )
+            self.weight = mx.zeros(
+                (out_features, in_features // 2), dtype=mx.uint8
+            )
+            self.scale = mx.zeros(
+                (out_features, in_features // FP4_WEIGHT_BLOCK_SIZE), dtype=mx.uint8
+            )
+        elif quant == "fp8":
+            if in_features % FP8_WEIGHT_BLOCK_SIZE:
+                raise ValueError(
+                    f"in_features={in_features} is not divisible by the FP8 weight "
+                    f"block size {FP8_WEIGHT_BLOCK_SIZE}; only the out axis may "
+                    "carry a partial tail block"
+                )
+            self.weight = mx.zeros((out_features, in_features), dtype=mx.uint8)
+            self.scale = mx.zeros(
+                (
+                    -(-out_features // FP8_WEIGHT_BLOCK_SIZE),
+                    in_features // FP8_WEIGHT_BLOCK_SIZE,
+                ),
+                dtype=mx.uint8,
+            )
+        elif quant is None:
+            self.weight = mx.zeros((out_features, in_features), dtype=dtype)
+        else:
+            raise ValueError(
+                f"unsupported quant {quant!r}; expected 'fp4', 'fp8' or None"
+            )
+
+    def dequantized(self) -> mx.array:
+        """Decode the packed weight to a dense float32 tensor.
+
+        Intentionally a method and not a cached property: the result must stay
+        transient (see the class docstring).
+        """
+        if self.quant == "fp4":
+            return dequantize_fp4_block(
+                self.weight, self.scale, FP4_WEIGHT_BLOCK_SIZE, mx.float32
+            )
+        if self.quant == "fp8":
+            return dequantize_fp8_block(
+                self.weight, self.scale, FP8_WEIGHT_BLOCK_SIZE, mx.float32
+            )
+        return self.weight.astype(mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"expected a trailing dimension of {self.in_features}, got shape "
+                f"{x.shape}"
+            )
+        return x.astype(mx.float32) @ self.dequantized().T
+
+
+class DeepseekV41Expert(nn.Module):
+    """One SwiGLU FFN expert (inference/model.py Expert).
+
+    The clamps come straight from training, where they keep fp8/fp4
+    activations in range: the up branch is clamped on both sides, the gate
+    branch only from above. The optional ``weights`` argument applies the
+    routing weight *before* the down projection, not after -- which matters
+    because w2 is quantized, so scaling after it would quantize a differently
+    scaled activation.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        inter_dim: int,
+        quant: Optional[str] = "fp4",
+        swiglu_limit: float = 0.0,
+        dtype=mx.bfloat16,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.inter_dim = inter_dim
+        self.swiglu_limit = float(swiglu_limit)
+        self.w1 = DeepseekV41PackedLinear(dim, inter_dim, quant, dtype)
+        self.w2 = DeepseekV41PackedLinear(inter_dim, dim, quant, dtype)
+        self.w3 = DeepseekV41PackedLinear(dim, inter_dim, quant, dtype)
+
+    def __call__(self, x: mx.array, weights: Optional[mx.array] = None) -> mx.array:
+        dtype = x.dtype
+        gate = self.w1(x).astype(mx.float32)
+        up = self.w3(x).astype(mx.float32)
+        if self.swiglu_limit > 0:
+            up = mx.clip(up, -self.swiglu_limit, self.swiglu_limit)
+            gate = mx.minimum(gate, self.swiglu_limit)
+        h = nn.silu(gate) * up
+        if weights is not None:
+            h = weights.astype(mx.float32) * h
+        return self.w2(h.astype(dtype))
+
+
+class DeepseekV41Gate(nn.Module):
+    """MoE gating (inference/model.py Gate).
+
+    ``weight`` is dense float32 (the reference builds it outside its fp8
+    ``set_dtype`` scope and casts to float for the GEMM), ``bias`` is the
+    routing correction bias, and ``bias_vl`` -- present only when the vision
+    tower is enabled -- replaces it for tokens inside an image span.
+    """
+
+    def __init__(
+        self,
+        config: TextConfig,
+        n_routed_experts: Optional[int] = None,
+        n_activated_experts: Optional[int] = None,
+        vision_enabled: bool = False,
+    ):
+        super().__init__()
+        n_routed = (
+            config.n_routed_experts if n_routed_experts is None else n_routed_experts
+        )
+        topk = (
+            config.num_experts_per_tok
+            if n_activated_experts is None
+            else n_activated_experts
+        )
+        validate_moe_routing_config(config, n_routed, topk)
+        self.dim = config.hidden_size
+        self.n_routed_experts = n_routed
+        self.topk = topk
+        self.scoring_func = config.scoring_func
+        self.norm_topk_prob = bool(config.norm_topk_prob)
+        self.routed_scaling_factor = float(config.routed_scaling_factor)
+        self.gate_temp = GATE_TEMP
+        self.vision_enabled = bool(vision_enabled)
+        self.weight = mx.zeros((n_routed, config.hidden_size), dtype=mx.float32)
+        self.bias = mx.zeros((n_routed,), dtype=mx.float32)
+        if self.vision_enabled:
+            self.bias_vl = mx.zeros((n_routed,), dtype=mx.float32)
+
+    def __call__(
+        self, x: mx.array, image_mask: Optional[mx.array] = None
+    ) -> Tuple[mx.array, mx.array]:
+        if x.shape[-1] != self.dim:
+            raise ValueError(
+                f"expected a trailing dimension of {self.dim}, got shape {x.shape}"
+            )
+        logits = (x.astype(mx.float32) @ self.weight.astype(mx.float32).T)
+        if self.gate_temp != 1.0:
+            logits = logits / self.gate_temp
+        scores = routing_scores(logits, self.scoring_func)
+        bias = self.bias.astype(mx.float32)
+        if image_mask is not None:
+            if not self.vision_enabled:
+                raise ValueError(
+                    "image_mask was supplied but this gate has no bias_vl: "
+                    "inference/model.py only allocates the VL routing bias when "
+                    "the vision tower is enabled, so a VL mask against a "
+                    "text-only gate is a wiring error, not a no-op"
+                )
+            if tuple(image_mask.shape) != tuple(x.shape[:-1]):
+                raise ValueError(
+                    f"image_mask shape {image_mask.shape} does not match the token "
+                    f"axes {tuple(x.shape[:-1])}"
+                )
+            bias = mx.where(
+                mx.expand_dims(image_mask, -1),
+                self.bias_vl.astype(mx.float32),
+                bias,
+            )
+        return noaux_tc_route(
+            scores,
+            bias,
+            self.topk,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+        )
+
+
+class DeepseekV41MoE(nn.Module):
+    """Top-k routed experts plus the one shared expert every token goes through
+    (inference/model.py MoE).
+
+    Routed experts are split across ranks, so only this rank's contiguous
+    ``[experts_start_idx, experts_end_idx)`` block is constructed at all -- a
+    rank never allocates, let alone unpacks, an expert another rank owns.
+    Combining the per-rank partial sums needs a cross-rank all-reduce, which
+    this slice deliberately does not implement: the partition is resolved and
+    inspectable, but executing at ``world_size > 1`` fails loud rather than
+    returning a silently incomplete sum.
+    """
+
+    def __init__(
+        self,
+        config: TextConfig,
+        n_routed_experts: Optional[int] = None,
+        n_activated_experts: Optional[int] = None,
+        expert_quant: Optional[str] = "fp4",
+        shared_expert_quant: Optional[str] = "fp8",
+        world_size: int = 1,
+        rank: int = 0,
+        vision_enabled: bool = False,
+        dtype=mx.bfloat16,
+    ):
+        super().__init__()
+        n_routed = (
+            config.n_routed_experts if n_routed_experts is None else n_routed_experts
+        )
+        topk = (
+            config.num_experts_per_tok
+            if n_activated_experts is None
+            else n_activated_experts
+        )
+        self.gate = DeepseekV41Gate(
+            config,
+            n_routed_experts=n_routed,
+            n_activated_experts=topk,
+            vision_enabled=vision_enabled,
+        )
+        self.dim = config.hidden_size
+        self.inter_dim = config.moe_intermediate_size
+        self.n_routed_experts = n_routed
+        self.topk = topk
+        self.world_size = world_size
+        self.rank = rank
+        start, end = routed_expert_partition(n_routed, world_size, rank)
+        self.experts_start_idx = start
+        self.experts_end_idx = end
+        self.experts = [
+            DeepseekV41Expert(
+                self.dim,
+                self.inter_dim,
+                expert_quant,
+                config.swiglu_limit,
+                dtype,
+            )
+            for _ in range(start, end)
+        ]
+        self.shared_experts = DeepseekV41Expert(
+            self.dim,
+            self.inter_dim,
+            shared_expert_quant,
+            config.swiglu_limit,
+            dtype,
+        )
+
+    @property
+    def n_local_experts(self) -> int:
+        return self.experts_end_idx - self.experts_start_idx
+
+    @property
+    def local_expert_ids(self) -> List[int]:
+        """The global routed-expert ids this rank owns."""
+        return list(range(self.experts_start_idx, self.experts_end_idx))
+
+    def expert(self, expert_id: int) -> DeepseekV41Expert:
+        """Look an expert up by its *global* id, refusing one another rank owns."""
+        if not self.experts_start_idx <= expert_id < self.experts_end_idx:
+            raise KeyError(
+                f"expert {expert_id} is not local to rank {self.rank}, which owns "
+                f"[{self.experts_start_idx}, {self.experts_end_idx})"
+            )
+        return self.experts[expert_id - self.experts_start_idx]
+
+    def __call__(
+        self, x: mx.array, image_mask: Optional[mx.array] = None
+    ) -> mx.array:
+        if self.world_size > 1:
+            raise NotImplementedError(
+                "DeepseekV41MoE executes only at world_size == 1. Each rank holds "
+                "a disjoint slice of the routed experts, so a real forward pass "
+                "needs the cross-rank all_reduce in inference/model.py "
+                "MoE.forward to sum the partial routed outputs before the shared "
+                "expert is added; that is deliberately not implemented in this "
+                "slice. The partition itself is resolved: see "
+                "routed_expert_partition and local_expert_ids."
+            )
+        if x.shape[-1] != self.dim:
+            raise ValueError(
+                f"expected a trailing dimension of {self.dim}, got shape {x.shape}"
+            )
+        shape = x.shape
+        flat = x.reshape(-1, self.dim)
+        mask = None if image_mask is None else image_mask.reshape(-1)
+        weights, indices = self.gate(flat, mask)
+
+        # One host sync per call, exactly as the reference does via
+        # bincount(...).tolist(): the routed set is data-dependent, and a dense
+        # all-expert formulation would have to unpack all 384 experts per layer.
+        buckets: Dict[int, List[Tuple[int, int]]] = {}
+        for token, row in enumerate(indices.tolist()):
+            for slot, expert_id in enumerate(row):
+                buckets.setdefault(expert_id, []).append(
+                    (token, token * self.topk + slot)
+                )
+
+        y = mx.zeros(flat.shape, dtype=mx.float32)
+        flat_weights = weights.reshape(-1)
+        for expert_id in sorted(buckets):
+            if not self.experts_start_idx <= expert_id < self.experts_end_idx:
+                continue
+            pairs = buckets[expert_id]
+            # A token selects any given expert at most once (top-k indices are
+            # distinct), so these row indices are unique and the read-modify-write
+            # below cannot drop a contribution.
+            tokens = mx.array([t for t, _ in pairs], dtype=mx.int32)
+            slots = mx.array([s for _, s in pairs], dtype=mx.int32)
+            out = self.experts[expert_id - self.experts_start_idx](
+                mx.take(flat, tokens, axis=0),
+                mx.take(flat_weights, slots).reshape(-1, 1),
+            )
+            y[tokens] = y[tokens] + out.astype(mx.float32)
+
+        y = y + self.shared_experts(flat).astype(mx.float32)
+        return y.astype(x.dtype).reshape(shape)
+
+
 class Model(nn.Module):
     """Registration entry point for model_type == "deepseek_v41".
 
@@ -1870,8 +2728,9 @@ class Model(nn.Module):
     FP8->dense-bf16 exception at load time. The base-decode attention and
     cache architecture is implemented in this module and is directly
     usable via DeepseekV41AttentionStack, but the glue that would turn it
-    into an end-to-end model (Hyper-Connections residual mixing, MoE
-    routing, sparse Engram, vision/aligner, DSpark/MTP) is still out of
+    into an end-to-end model (the Block/Transformer glue joining the
+    attention stack to DeepseekV41HyperConnections and DeepseekV41MoE,
+    sparse Engram, vision/aligner, DSpark/MTP) is still out of
     scope, so this Model still holds no layers and __call__ raises rather
     than faking a result. Loading real checkpoint weights
     against this Model will fail closed (a strict tensor-name/shape
@@ -1889,10 +2748,11 @@ class Model(nn.Module):
             "deepseek_v41.Model does not implement a forward pass yet. "
             "The base-decode attention and cache architecture IS "
             "implemented and executable: build DeepseekV41AttentionStack "
-            "directly against make_deepseek_v41_attention_caches. Still "
-            "deferred: Hyper-Connections Sinkhorn split/merge, 384+1 MoE "
-            "routing, sparse Engram row-sharded gather, vision/aligner "
-            "token-budget arithmetic, and DSpark/MTP."
+            "directly against make_deepseek_v41_attention_caches, and so "
+            "are DeepseekV41HyperConnections and DeepseekV41MoE. Still "
+            "deferred: the Block/Transformer glue that joins them, sparse "
+            "Engram row-sharded gather, vision/aligner token-budget "
+            "arithmetic, and DSpark/MTP."
         )
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
