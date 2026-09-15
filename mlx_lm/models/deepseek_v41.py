@@ -4595,6 +4595,13 @@ class DeepseekV41Vision(nn.Module):
                 unknown = set(int(t) for t in types.tolist()) - _IMAGE_TOKEN_TYPES
                 if unknown:
                     raise ValueError(f"unsupported image token types {sorted(unknown)}")
+                n_llm_h = math.ceil(int(img.n_vit_h) / self.aligner.downsample_ratio)
+                n_llm_w = math.ceil(int(img.n_vit_w) / self.aligner.downsample_ratio)
+                expected_types = np.asarray(image_token_types(n_llm_h, n_llm_w))
+                if not np.array_equal(types, expected_types):
+                    raise ValueError(
+                        f"image span types do not match canonical {n_llm_h}x{n_llm_w} grid"
+                    )
                 start = int(img.start)
                 end = start + int(types.size)
                 if start < 0 or end > seqlen:

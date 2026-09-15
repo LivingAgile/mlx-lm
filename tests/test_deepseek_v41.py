@@ -3606,6 +3606,18 @@ class TestDeepseekV41VisionMerge(unittest.TestCase):
                 [[ImageInput(0, patches, 2, 2, mx.array([9, 9, 9, 9], dtype=mx.int32))]],
                 stream,
             )
+        malformed_known_types = (
+            [IMAGE],
+            [IMAGE_START, IMAGE, IMAGE_END, IMAGE_NEW_LINE],
+            [IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_NEW_LINE, IMAGE_END],
+            [IMAGE_START, IMAGE, IMAGE, IMAGE_NEW_LINE, IMAGE_END],
+        )
+        for malformed in malformed_known_types:
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                tower.merge_image_embeddings(
+                    [[ImageInput(0, patches, 2, 2, mx.array(malformed, dtype=mx.int32))]],
+                    stream,
+                )
         with self.assertRaises(ValueError):
             tower.merge_image_embeddings([[ImageInput(0, patches, 2, 2, types)]], mx.array(np.ones((1, 4, 8, 4), dtype=np.float32)))
         with self.assertRaises(ValueError):
