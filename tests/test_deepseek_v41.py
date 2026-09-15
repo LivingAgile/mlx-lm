@@ -414,7 +414,7 @@ class TestDeepseekV41QuantPrimitives(unittest.TestCase):
         # block scheme; reuse Probe 1 bytes as a stand-in wo_a-shaped tile
         # to prove the wo_a path performs the identical faithful math (cast
         # to dense bfloat16, not merely transiently dequantized).
-        weight_hex = "d871f2797069f0e55370eee3dcd8776"
+        weight_hex = "d871f2797069f0e55370eee3dcd8776d"
         weight_bytes = bytes.fromhex(weight_hex)
         weight = mx.array(list(weight_bytes), dtype=mx.uint8).reshape(1, 16)
         # Pad to a (32, 32) tile is unnecessary here: use a (1, 16) input is
