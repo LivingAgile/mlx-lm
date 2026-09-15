@@ -148,6 +148,46 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(set(loaded), {"keep"})
         self.assertTrue(mx.array_equal(loaded["keep"], keep))
 
+    def test_load_model_honors_file_backed_exclusion_before_mx_load(self):
+        class _Args:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class _Model(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+                self.keep = mx.zeros((3,), dtype=mx.uint8)
+
+            def prepare_file_backed_weights(self, model_path, weight_files):
+                path = str(Path(weight_files[0]).resolve())
+                return {path: {"excluded"}}
+
+        path = Path(self.test_dir) / "model-00001-of-00001.safetensors"
+        keep = mx.array([11, 13, 17], dtype=mx.uint8)
+        header = {
+            "keep": {"dtype": "U8", "shape": [3], "data_offsets": [0, 3]},
+            "excluded": {
+                "dtype": "U8",
+                "shape": [1_000_000_000],
+                "data_offsets": [3, 1_000_000_003],
+            },
+        }
+        encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        encoded += b" " * ((-len(encoded)) % 8)
+        with open(path, "wb") as handle:
+            handle.write(struct.pack("<Q", len(encoded)))
+            handle.write(encoded)
+            handle.write(bytes(memoryview(keep)))
+        with open(Path(self.test_dir) / "config.json", "w") as handle:
+            json.dump({"model_type": "test"}, handle)
+
+        model, _ = utils.load_model(
+            Path(self.test_dir),
+            get_model_classes=lambda config: (_Model, _Args),
+        )
+        self.assertTrue(mx.array_equal(model.keep, keep))
+
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
         from mlx_lm.models import gemma4
 

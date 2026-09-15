@@ -3279,6 +3279,7 @@ def build_engram_compressed_token_map_from_tokenizer(
     Uses the raw Rust backend directly, matching what training decoded with
     (no clean_up_tokenization_spaces, no skip_special_tokens).
     """
+    tokenizer = getattr(tokenizer, "_tokenizer", tokenizer)
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is None:
         raise ValueError(

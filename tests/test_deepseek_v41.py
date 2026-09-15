@@ -2503,6 +2503,27 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
             build_engram_compressed_token_map_from_tokenizer(_NoBackend())
         self.assertIn("backend_tokenizer", str(ctx.exception))
 
+    def test_mlx_tokenizer_wrapper_is_unwrapped_before_len(self):
+        class _Backend:
+            def decode(self, ids, skip_special_tokens=False):
+                return ("A", "a", " ")[ids[0]]
+
+            def id_to_token(self, token_id):
+                return ("A", "a", "SPACE")[token_id]
+
+        class _Tokenizer:
+            backend_tokenizer = _Backend()
+
+            def __len__(self):
+                return 3
+
+        class _Wrapper:
+            _tokenizer = _Tokenizer()
+
+        lookup, size = build_engram_compressed_token_map_from_tokenizer(_Wrapper())
+        self.assertEqual(lookup, [0, 0, 1])
+        self.assertEqual(size, 2)
+
 
 class TestDeepseekV41EngramLayout(unittest.TestCase):
     """Prime bucket layout, checked against the real pinned config."""
@@ -3865,6 +3886,14 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
         self.assertTrue(np.isfinite(np.asarray(prefill)).all())
         self.assertGreater(float(mx.max(mx.abs(prefill))), 0.0)
         self.assertEqual([layer_cache.offset for layer_cache in cache], [4, 4])
+        full = model(mx.array([[1, 2, 3, 4]], dtype=mx.int32))
+        self.assertTrue(mx.allclose(decode, full[:, -1:], atol=1e-4, rtol=1e-4))
+        self.assertFalse(
+            any(
+                name.startswith("_runtime.")
+                for name, _ in tree_flatten(model.parameters())
+            )
+        )
 
     def test_file_backed_loader_claims_only_the_engram_table_payloads(self):
         config = _full_config_dict()
@@ -3971,6 +4000,40 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
                 mx.allclose(main_hidden[:, 0:1], mx.mean(expanded[:, 0:1], axis=2))
             )
             embedding.cache.store.close()
+
+    def test_file_backed_loader_rejects_missing_or_wrong_engram_state(self):
+        model = Model(ModelArgs.from_dict(_full_config_dict()))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model-00001-of-00001.safetensors"
+            weight, scale = _random_engram_shard(2, 32, 32, seed=23)
+            _write_engram_fixture(path, weight, scale)
+            with self.assertRaisesRegex(ValueError, "missing file-backed Engram"):
+                model.prepare_file_backed_weights(Path(tmp), [path])
+
+        config = _full_config_dict()
+        text = config["text_config"] | {
+            "engram_layer_ids": [0],
+            "engram_num_embeddings": [408],
+            "engram_max_ngram_size": 3,
+            "engram_vocab_size": 97,
+            "engram_n_heads": 2,
+            "engram_head_dim": 32,
+        }
+        config["text_config"] = text
+        config["vision_config"] = _vision_config_dict() | {"num_hidden_layers": 0}
+        small = Model(ModelArgs.from_dict(config))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model-00001-of-00001.safetensors"
+            weight, scale = _random_engram_shard(407, 32, 32, seed=29)
+            _write_engram_fixture(
+                path,
+                weight,
+                scale,
+                weight_key="layers.0.engram.embed.weight",
+                scale_key="layers.0.engram.embed.scale",
+            )
+            with self.assertRaisesRegex(ValueError, "config requires"):
+                small.prepare_file_backed_weights(Path(tmp), [path])
 
 
 if __name__ == "__main__":
