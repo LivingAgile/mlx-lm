@@ -1,6 +1,8 @@
 # Copyright © 2024 Apple Inc.
 
+import json
 import os
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,6 +125,28 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(hasattr(model, "custom_attribute"))
         self.assertEqual(model.custom_attribute, "This is a custom model")
         self.assertTrue(hasattr(model, "qwenWeights"))
+
+    def test_selective_safetensor_load_never_reads_excluded_payload(self):
+        path = Path(self.test_dir) / "selective.safetensors"
+        keep = mx.array([3, 5, 7], dtype=mx.uint8)
+        header = {
+            "keep": {"dtype": "U8", "shape": [3], "data_offsets": [0, 3]},
+            "excluded": {
+                "dtype": "U8",
+                "shape": [1_000_000_000],
+                "data_offsets": [3, 1_000_000_003],
+            },
+        }
+        encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        encoded += b" " * ((-len(encoded)) % 8)
+        with open(path, "wb") as handle:
+            handle.write(struct.pack("<Q", len(encoded)))
+            handle.write(encoded)
+            handle.write(bytes(memoryview(keep)))
+
+        loaded = utils._load_safetensors_with_e8m0(str(path), {"excluded"})
+        self.assertEqual(set(loaded), {"keep"})
+        self.assertTrue(mx.array_equal(loaded["keep"], keep))
 
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
         from mlx_lm.models import gemma4

@@ -280,7 +280,10 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
-def _load_safetensors_with_e8m0(path: str) -> Dict[str, mx.array]:
+def _load_safetensors_with_e8m0(
+    path: str, excluded: Optional[set[str]] = None
+) -> Dict[str, mx.array]:
+    excluded = excluded or set()
     with open(path, "rb") as f:
         header_len = struct.unpack("<Q", f.read(8))[0]
         header_bytes = f.read(header_len)
@@ -293,6 +296,8 @@ def _load_safetensors_with_e8m0(path: str) -> Dict[str, mx.array]:
             if name == "__metadata__":
                 remaining_header[name] = meta
                 continue
+            if name in excluded:
+                continue
             if isinstance(meta, dict) and meta.get("dtype") == "F8_E8M0":
                 start, end = meta["data_offsets"]
                 f.seek(data_offset + start)
@@ -302,7 +307,7 @@ def _load_safetensors_with_e8m0(path: str) -> Dict[str, mx.array]:
             else:
                 remaining_header[name] = meta
 
-    if not e8m0_tensors:
+    if not e8m0_tensors and not excluded:
         # Shouldn't reach here if caller filtered correctly, but fall back anyway.
         return dict(mx.load(path))
 
@@ -344,7 +349,11 @@ def _load_safetensors_with_e8m0(path: str) -> Dict[str, mx.array]:
             for blob in payloads:
                 out.write(blob)
 
-        merged = dict(mx.load(str(scratch)))
+        merged = (
+            dict(mx.load(str(scratch)))
+            if any(name != "__metadata__" for name in new_header)
+            else {}
+        )
     finally:
         try:
             scratch.unlink()
@@ -394,15 +403,6 @@ def load_model(
     if not weight_files and strict:
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
-    weights = {}
-    for wf in weight_files:
-        try:
-            weights.update(mx.load(wf))
-        except RuntimeError as e:
-            if "F8_E8M0" not in str(e):
-                raise
-            weights.update(_load_safetensors_with_e8m0(wf))
-
     if (model_file := config.get("model_file")) is not None:
         spec = importlib.util.spec_from_file_location(
             "custom_model",
@@ -422,6 +422,23 @@ def load_model(
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
+
+    excluded_by_file = {}
+    if hasattr(model, "prepare_file_backed_weights"):
+        excluded_by_file = model.prepare_file_backed_weights(model_path, weight_files)
+
+    weights = {}
+    for wf in weight_files:
+        excluded = set(excluded_by_file.get(str(Path(wf).resolve()), ()))
+        if excluded:
+            weights.update(_load_safetensors_with_e8m0(wf, excluded))
+            continue
+        try:
+            weights.update(mx.load(wf))
+        except RuntimeError as e:
+            if "F8_E8M0" not in str(e):
+                raise
+            weights.update(_load_safetensors_with_e8m0(wf))
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
@@ -576,6 +593,8 @@ def load(
     tokenizer = load_tokenizer(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
+    if hasattr(model, "bind_tokenizer"):
+        model.bind_tokenizer(tokenizer)
 
     if return_config:
         return model, tokenizer, config

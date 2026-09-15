@@ -47,6 +47,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
@@ -373,7 +374,7 @@ class TestDeepseekV41Config(unittest.TestCase):
     def test_model_call_fails_loud_not_fake(self):
         args = ModelArgs.from_dict(_full_config_dict())
         model = Model(args)
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(RuntimeError, "Engram is configured but not bound"):
             model(mx.array([[1, 2, 3]]))
 
 
@@ -2364,6 +2365,8 @@ def _write_engram_fixture(
     scale,
     weight_dtype="F8_E4M3",
     scale_dtype="F8_E8M0",
+    weight_key="weight",
+    scale_key="scale",
     mutate=None,
 ):
     """Write a real, tiny safetensors file holding one packed Engram shard.
@@ -2375,12 +2378,12 @@ def _write_engram_fixture(
     weight = np.ascontiguousarray(weight, dtype=np.uint8)
     scale = np.ascontiguousarray(scale, dtype=np.uint8)
     header = {
-        "weight": {
+        weight_key: {
             "dtype": weight_dtype,
             "shape": list(weight.shape),
             "data_offsets": [0, weight.nbytes],
         },
-        "scale": {
+        scale_key: {
             "dtype": scale_dtype,
             "shape": list(scale.shape),
             "data_offsets": [weight.nbytes, weight.nbytes + scale.nbytes],
@@ -3812,8 +3815,162 @@ class TestDeepseekV41PublicNames(unittest.TestCase):
         self.assertEqual(out["layers.0.attn.wo_a.weight"].dtype, mx.bfloat16)
         with self.assertRaises(ValueError):
             require_public_weights({}, vision_public_weight_names(vision, 8)[:3])
-        with self.assertRaises(NotImplementedError):
-            model(mx.array([[1, 2, 3]]))
+
+
+class TestDeepseekV41ModelComposition(unittest.TestCase):
+    def _args(self):
+        config = _full_config_dict()
+        text = _text_config_dict()
+        text.update(
+            {
+                "vocab_size": 64,
+                "hidden_size": 32,
+                "moe_intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_nextn_predict_layers": 0,
+                "compress_ratios": [0, 0],
+                "kv_source_layer_ids": [],
+                "index_source_layer_ids": [],
+                "candidate_source_layer_id": -1,
+                "n_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "qk_rope_head_dim": 8,
+                "q_lora_rank": 32,
+                "o_groups": 2,
+                "o_lora_rank": 8,
+                "sliding_window": 4,
+                "engram_layer_ids": [],
+                "engram_num_embeddings": [],
+                "dspark_block_size": 0,
+                "dspark_target_layer_ids": [],
+            }
+        )
+        config["text_config"] = text
+        config["vision_config"] = _vision_config_dict() | {"num_hidden_layers": 0}
+        return ModelArgs.from_dict(config)
+
+    def test_tiny_backbone_runs_prefill_then_decode_through_the_registered_model(self):
+        model = Model(self._args())
+        model.embed.weight = mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
+        model.head.weight = mx.eye(64, 32, dtype=mx.float32)
+        cache = model.make_cache()
+
+        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
+
+        self.assertEqual(prefill.shape, (1, 3, 64))
+        self.assertEqual(decode.shape, (1, 1, 64))
+        self.assertTrue(np.isfinite(np.asarray(prefill)).all())
+        self.assertGreater(float(mx.max(mx.abs(prefill))), 0.0)
+        self.assertEqual([layer_cache.offset for layer_cache in cache], [4, 4])
+
+    def test_file_backed_loader_claims_only_the_engram_table_payloads(self):
+        config = _full_config_dict()
+        text = _text_config_dict()
+        text.update(
+            {
+                "vocab_size": 64,
+                "hidden_size": 32,
+                "moe_intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_nextn_predict_layers": 0,
+                "compress_ratios": [0, 0],
+                "kv_source_layer_ids": [],
+                "index_source_layer_ids": [],
+                "candidate_source_layer_id": -1,
+                "n_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "qk_rope_head_dim": 8,
+                "q_lora_rank": 32,
+                "o_groups": 2,
+                "o_lora_rank": 8,
+                "sliding_window": 4,
+                "engram_layer_ids": [0],
+                "engram_num_embeddings": [408],
+                "engram_max_ngram_size": 3,
+                "engram_vocab_size": 97,
+                "engram_n_heads": 2,
+                "engram_head_dim": 32,
+                "engram_pad_token_id": 2,
+                "engram_compressed_vocab_size": 11,
+                "dspark_block_size": 0,
+                "dspark_target_layer_ids": [0],
+            }
+        )
+        config["text_config"] = text
+        config["vision_config"] = _vision_config_dict() | {
+            "num_hidden_layers": 1,
+            "hidden_size": 16,
+            "num_attention_heads": 2,
+            "intermediate_size": 32,
+            "patch_size": 2,
+            "downsample_ratio": 2,
+            "max_image_tokens": 64,
+            "min_pixels": 16,
+        }
+        model = Model(ModelArgs.from_dict(config))
+        rows = text["engram_num_embeddings"][0]
+        weight, scale = _random_engram_shard(rows, 32, 32, seed=17)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model-00001-of-00001.safetensors"
+            weight_key = "layers.0.engram.embed.weight"
+            scale_key = "layers.0.engram.embed.scale"
+            _write_engram_fixture(
+                path,
+                weight,
+                scale,
+                weight_key=weight_key,
+                scale_key=scale_key,
+            )
+            excluded = model.prepare_file_backed_weights(Path(tmp), [path])
+            self.assertEqual(
+                excluded[str(path.resolve())], {weight_key, scale_key}
+            )
+            names = dict(tree_flatten(model.parameters()))
+            self.assertIn("layers.0.engram.wkv.weight", names)
+            self.assertIn("layers.0.engram.q_weight", names)
+            self.assertNotIn(weight_key, names)
+            embedding = model.layers[0].engram.embed
+            self.assertEqual(embedding.cache.store.bytes_read, 0)
+            embedding(mx.array([0], dtype=mx.int32))
+            self.assertEqual(embedding.cache.store.rows_read, 1)
+            embedding.cache.clear()
+            model.embed.weight = (
+                mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
+            )
+            model.layers[0].engram.wkv.weight = mx.ones_like(
+                model.layers[0].engram.wkv.weight
+            )
+            model._runtime.bind_engram_hasher(
+                EngramNgramHasher(
+                    model._runtime.engram_layout,
+                    _ENGRAM_TOKEN_MAP + [i % 11 for i in range(24)],
+                    2,
+                    11,
+                    max_seq_len=16,
+                )
+            )
+            input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+            expanded = expand_hyper_connection_stream(
+                model.embed(input_ids), model.args.text_config.hc_mult
+            )
+            _, main_hidden = model.forward_main(
+                input_ids,
+                token_types=mx.array([[-1, IMAGE, -1]], dtype=mx.int32),
+            )
+            expected_masked = mx.mean(expanded[:, 1:2], axis=2)
+            self.assertTrue(
+                mx.allclose(main_hidden[:, 1:2], expected_masked)
+            )
+            self.assertFalse(
+                mx.allclose(main_hidden[:, 0:1], mx.mean(expanded[:, 0:1], axis=2))
+            )
+            embedding.cache.store.close()
 
 
 if __name__ == "__main__":

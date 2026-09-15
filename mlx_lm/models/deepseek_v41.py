@@ -78,15 +78,13 @@ architecture (Plan 0051 M2). It provides:
     the later loader must accept.
 
 
-Explicitly out of scope for this slice (tracked as later M2/M3 work, not
-faked here): the Block/Transformer glue that would wire the attention stack,
-the Hyper-Connections, the MoE, the Engram path and the vision merge
-into one backbone, and DSpark/MTP. ``Model``
-is registered (``model_type == "deepseek_v41"``, not a ``deepseek_v4`` alias)
-so config validation and packed-weight loading are exercisable now, but
-``Model.__call__`` raises ``NotImplementedError`` naming the deferred pieces
-rather than silently producing an unfaithful forward pass: the attention
-stack above is real, and the glue around it is honestly absent.
+The registered ``Model`` composes these pieces into the exact public checkpoint
+tree (``embed``, ``layers.*``, ``norm``, ``head``, ``mtp.*``, and optional
+vision leaves). Its load hook keeps the two giant Engram tables file-backed and
+excludes only those four payloads from ordinary MLX loading; all other tensors
+remain subject to strict name and shape validation. The tokenizer-derived
+compressed map is bound after tokenizer loading and must match the configured
+compressed vocabulary exactly.
 """
 
 import json
@@ -95,6 +93,7 @@ import re
 import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -4966,53 +4965,336 @@ class DeepseekV41Vision(nn.Module):
         return mx.array(h_np)
 
 
-class Model(nn.Module):
-    """Registration entry point for model_type == "deepseek_v41".
+class DeepseekV41Block(DeepseekV41HyperConnections):
+    """One exact backbone block over the Hyper-Connection residual stream."""
 
-    This is an exact V4.1 architecture registration (not a deepseek_v4
-    alias): ModelArgs fails closed on every V4.1-specific required field
-    (see module docstring), and sanitize applies the real, faithful wo_a
-    FP8->dense-bf16 exception at load time. The base-decode attention and
-    cache architecture is implemented in this module and is directly
-    usable via DeepseekV41AttentionStack, as are
-    DeepseekV41HyperConnections, DeepseekV41MoE and the sparse Engram path
-    (DeepseekV41Engram over a file-backed DeepseekV41EngramEmbedding). The
-    glue that would turn them into an end-to-end model (the
-    Block/Transformer glue joining them) is still out of scope. DSpark/MTP is
-    implemented as the isolated DeepseekV41DSpark.forward_spec path, without
-    inventing a speculative serving driver. Vision/aligner is implemented as DeepseekV41Vision, independently
-    of this class; __call__ still raises rather than faking a result. Loading real checkpoint weights
-    against this Model will fail closed (a strict tensor-name/shape
-    mismatch), which is the correct, honest outcome until the deferred
-    architecture lands.
-    """
+    def __init__(
+        self,
+        config: TextConfig,
+        policy: AttentionLayerPolicy,
+        vision_on: bool,
+    ):
+        super().__init__(config)
+        self.layer_id = policy.layer_id
+        self.attn = DeepseekV41Attention(config, policy)
+        self.ffn = DeepseekV41MoE(config, vision_enabled=vision_on)
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.engram: Optional[DeepseekV41Engram] = None
+
+    def inject_engram(self, x, hash_ids, token_mask=None):
+        if self.engram is None:
+            return x
+        if hash_ids is None:
+            raise ValueError(
+                f"Engram layer {self.layer_id} requires hash ids from the bound "
+                "EngramNgramHasher"
+            )
+        return self.engram(x, hash_ids, token_mask)
+
+    def __call__(self, x, pre_mix, cache, image_mask=None):
+        x, attn_pre = self.sublayer_step(
+            x,
+            pre_mix,
+            lambda value: self.attn(self.attn_norm(value), cache),
+            "attn",
+        )
+        return self.sublayer_step(
+            x,
+            attn_pre,
+            lambda value: self.ffn(self.ffn_norm(value), image_mask),
+            "ffn",
+        )
+
+
+class DeepseekV41Transformer(nn.Module):
+    """Embed, optional vision/Engram, backbone blocks, collapse, and logits."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        config = args.text_config
+        self.config = config
+        self.hc_mult = config.hc_mult
+        self.target_layer_ids = tuple(config.dspark_target_layer_ids)
+        self.engram_layout = validate_engram_config(config)
+        self.engram_hash: Optional[EngramNgramHasher] = None
+        self.embed = DeepseekV41DSparkEmbedding(config.vocab_size, config.hidden_size)
+        policies = resolve_attention_layer_policies(config)
+        vision_on = vision_enabled(args)
+        self.layers = [
+            DeepseekV41Block(config, policy, vision_on) for policy in policies
+        ]
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head = DeepseekV41DSparkHead(config.vocab_size, config.hidden_size)
+        self.mtp = [
+            DeepseekV41DSparkBlock(config, config.num_hidden_layers + stage_id)
+            for stage_id in range(config.num_nextn_predict_layers)
+        ]
+        if vision_on:
+            vision_runtime = DeepseekV41Vision(args.vision_config, config.hidden_size)
+            self.vision = vision_runtime.vision
+            self.aligner = vision_runtime.aligner
+            self.image_start = vision_runtime.image_start
+            self.image_end = vision_runtime.image_end
+            self.image_newline = vision_runtime.image_newline
+
+    def make_cache(self) -> List[DeepseekV41AttentionCache]:
+        return make_deepseek_v41_attention_caches(
+            self.config, len(self.layers)
+        )
+
+    def bind_engram_modules(self, modules: Dict[int, DeepseekV41Engram]) -> None:
+        if self.engram_layout is None:
+            raise ValueError("cannot bind Engram to a config with no Engram layers")
+        expected = set(self.engram_layout.layer_ids)
+        if set(modules) != expected:
+            raise ValueError(
+                f"Engram modules must cover exactly layers {sorted(expected)}, "
+                f"got {sorted(modules)}"
+            )
+        for layer_id, module in modules.items():
+            if module.layer_id != layer_id:
+                raise ValueError(
+                    f"Engram module key {layer_id} carries layer {module.layer_id}"
+                )
+            self.layers[layer_id].engram = module
+
+    def bind_engram_hasher(self, hasher: EngramNgramHasher) -> None:
+        if self.engram_layout is None or hasher.layout != self.engram_layout:
+            raise ValueError("Engram hasher layout does not match the model config")
+        self.engram_hash = hasher
+
+    def bind_engram(
+        self,
+        hasher: EngramNgramHasher,
+        modules: Dict[int, DeepseekV41Engram],
+    ) -> None:
+        self.bind_engram_modules(modules)
+        self.bind_engram_hasher(hasher)
+
+    def encode_image(self, patches, n_vit_h: int, n_vit_w: int) -> mx.array:
+        if not hasattr(self, "vision"):
+            raise ValueError("image input was supplied to a text-only model")
+        return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
+
+    def merge_image_embeddings(self, images, hidden: mx.array) -> mx.array:
+        if not hasattr(self, "vision"):
+            if images is None or all(not sample for sample in images):
+                return hidden
+            raise ValueError("image input was supplied to a text-only model")
+        return DeepseekV41Vision.merge_image_embeddings(self, images, hidden)
+
+    def forward_main(self, input_ids, cache=None, images=None, token_types=None):
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must be [batch, seqlen], got {input_ids.shape}")
+        if cache is None:
+            cache = self.make_cache()
+        if len(cache) != len(self.layers):
+            raise ValueError(
+                f"expected {len(self.layers)} layer caches, got {len(cache)}"
+            )
+        start_pos = cache[0].offset
+        if any(layer_cache.offset != start_pos for layer_cache in cache):
+            raise ValueError("all backbone layer caches must have the same offset")
+        image_mask = None
+        if token_types is not None:
+            if tuple(token_types.shape) != tuple(input_ids.shape):
+                raise ValueError(
+                    f"token_types shape {token_types.shape} must match input_ids "
+                    f"shape {input_ids.shape}"
+                )
+            image_mask = token_types >= 0
+        engram_mask = None if image_mask is None else ~image_mask
+        hashes = None
+        if self.engram_layout is not None:
+            if self.engram_hash is None:
+                raise RuntimeError(
+                    "Engram is configured but not bound to file-backed row stores"
+                )
+            hashes = self.engram_hash(input_ids, start_pos, engram_mask)
+
+        hidden = self.embed(input_ids)
+        if images is not None:
+            if start_pos != 0:
+                raise ValueError("image spans must be prefilled at cache offset zero")
+            hidden = self.merge_image_embeddings(images, hidden)
+        hidden = expand_hyper_connection_stream(hidden, self.hc_mult)
+        pre_mix = make_identity_pre_mix(
+            hidden.shape[0], hidden.shape[1], self.hc_mult
+        )
+        main_hiddens = []
+        for layer_id, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
+            layer_hashes = None
+            if layer.engram is not None:
+                layer_hashes = hashes[:, :, layer.engram.layer_hash_index, :]
+            hidden = layer.inject_engram(hidden, layer_hashes, engram_mask)
+            if layer_id in self.target_layer_ids:
+                main_hiddens.append(mx.mean(hidden, axis=2))
+            hidden, pre_mix = layer(hidden, pre_mix, layer_cache, image_mask)
+
+        hidden = hc_pre(hidden, pre_mix)
+        logits = self.head(self.norm(hidden), full_logits=True)
+        main_hidden = (
+            mx.concatenate(main_hiddens, axis=-1) if main_hiddens else None
+        )
+        return logits, main_hidden
+
+    def __call__(self, input_ids, cache=None, images=None, token_types=None):
+        logits, _ = self.forward_main(input_ids, cache, images, token_types)
+        return logits
+
+    def forward_spec(self, input_ids, main_hidden, start_pos: int = 0):
+        if not self.mtp:
+            raise ValueError("DSpark is disabled for this model")
+        x, main_x = self.mtp[0].forward_embed(main_hidden, input_ids, self.embed)
+        pre_mix = make_identity_pre_mix(x.shape[0], x.shape[1], self.hc_mult)
+        for layer in self.mtp:
+            x, pre_mix = layer(x, start_pos, pre_mix, main_x)
+        if start_pos == 0:
+            return None
+        return self.mtp[-1].forward_head(x, pre_mix, input_ids, self.head)
+
+
+class Model(nn.Module):
+    """Registered exact V4.1 model with public checkpoint parameter names."""
 
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
+        transformer = DeepseekV41Transformer(args)
+        self.embed = transformer.embed
+        self.layers = transformer.layers
+        self.norm = transformer.norm
+        self.head = transformer.head
+        self.mtp = transformer.mtp
+        self._runtime = transformer
+        if hasattr(transformer, "vision"):
+            self.vision = transformer.vision
+            self.aligner = transformer.aligner
+            self.image_start = transformer.image_start
+            self.image_end = transformer.image_end
+            self.image_newline = transformer.image_newline
 
-    def __call__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "deepseek_v41.Model does not implement a forward pass yet. "
-            "The base-decode attention and cache architecture IS "
-            "implemented and executable: build DeepseekV41AttentionStack "
-            "directly against make_deepseek_v41_attention_caches, and so "
-            "are DeepseekV41HyperConnections, DeepseekV41MoE and the sparse "
-            "Engram path (EngramNgramHasher -> BoundedEngramRowCache over "
-            "a SafetensorsEngramRowStore -> DeepseekV41EngramEmbedding -> "
-            "DeepseekV41Engram). Still deferred: the Block/Transformer "
-            "glue that joins them. Isolated DSpark/MTP forward_spec and vision/aligner "
-            "token-budget arithmetic is implemented as DeepseekV41Vision."
+    def _sync_runtime(self):
+        self._runtime.embed = self.embed
+        self._runtime.layers = self.layers
+        self._runtime.norm = self.norm
+        self._runtime.head = self.head
+        self._runtime.mtp = self.mtp
+        for name in ("vision", "aligner", "image_start", "image_end", "image_newline"):
+            if hasattr(self, name):
+                setattr(self._runtime, name, getattr(self, name))
+
+    def __call__(self, inputs, cache=None, images=None, token_types=None):
+        self._sync_runtime()
+        return self._runtime(inputs, cache, images, token_types)
+
+    def forward_main(self, inputs, cache=None, images=None, token_types=None):
+        self._sync_runtime()
+        return self._runtime.forward_main(inputs, cache, images, token_types)
+
+    def forward_spec(self, input_ids, main_hidden, start_pos: int = 0):
+        self._sync_runtime()
+        return self._runtime.forward_spec(input_ids, main_hidden, start_pos)
+
+    def make_cache(self):
+        return self._runtime.make_cache()
+
+    def bind_engram(self, hasher, modules):
+        self._runtime.bind_engram(hasher, modules)
+
+    def bind_tokenizer(self, tokenizer, max_batch_size: int = 1):
+        layout = self._runtime.engram_layout
+        if layout is None:
+            return
+        token_map, compressed_size = (
+            build_engram_compressed_token_map_from_tokenizer(tokenizer)
         )
+        expected = self.args.text_config.engram_compressed_vocab_size
+        if compressed_size != expected:
+            raise ValueError(
+                f"tokenizer produces {compressed_size} compressed Engram tokens, "
+                f"but the checkpoint config requires {expected}"
+            )
+        hasher = EngramNgramHasher(
+            layout,
+            token_map,
+            self.args.text_config.engram_pad_token_id,
+            compressed_size,
+            max_batch_size=max_batch_size,
+            max_seq_len=self.args.text_config.max_position_embeddings,
+        )
+        self._runtime.bind_engram_hasher(hasher)
+
+    def prepare_file_backed_weights(self, model_path, weight_files):
+        """Bind official Engram tables by path and exclude their payloads from MLX."""
+        layout = self._runtime.engram_layout
+        if layout is None:
+            return {}
+        weight_files = [Path(path).resolve() for path in weight_files]
+        tensor_files = {}
+        for path in weight_files:
+            with open(path, "rb") as handle:
+                raw_len = handle.read(8)
+                if len(raw_len) != 8:
+                    raise ValueError(f"{path} has no safetensors header length")
+                header_len = int.from_bytes(raw_len, "little", signed=False)
+                if header_len < 2 or header_len > _SAFETENSORS_HEADER_LIMIT:
+                    raise ValueError(
+                        f"{path} declares an implausible safetensors header length"
+                    )
+                header = json.loads(handle.read(header_len).decode("utf-8"))
+            for name in header:
+                if name != "__metadata__":
+                    if name in tensor_files:
+                        raise ValueError(f"duplicate checkpoint tensor {name!r}")
+                    tensor_files[name] = path
+
+        excluded_by_file = {}
+        modules = {}
+        for layer_id, num_embeddings in zip(
+            layout.layer_ids, layout.num_embeddings
+        ):
+            prefix = f"layers.{layer_id}.engram.embed"
+            weight_key, scale_key = f"{prefix}.weight", f"{prefix}.scale"
+            missing = [key for key in (weight_key, scale_key) if key not in tensor_files]
+            if missing:
+                raise ValueError(
+                    f"checkpoint is missing file-backed Engram tensors {missing}"
+                )
+            path = tensor_files[weight_key]
+            if tensor_files[scale_key] != path:
+                raise ValueError(
+                    f"{weight_key} and {scale_key} must share one safetensors file"
+                )
+            store = SafetensorsEngramRowStore(
+                str(path), weight_key=weight_key, scale_key=scale_key
+            )
+            if store.num_rows != num_embeddings or store.dim != layout.head_dim:
+                store.close()
+                raise ValueError(
+                    f"{weight_key} has shape {(store.num_rows, store.dim)} but "
+                    f"the config requires {(num_embeddings, layout.head_dim)}"
+                )
+            cache = BoundedEngramRowCache(store)
+            embedding = DeepseekV41EngramEmbedding(
+                num_embeddings, layout.head_dim, cache
+            )
+            modules[layer_id] = DeepseekV41Engram(
+                self.args.text_config, layer_id, layout, embedding
+            )
+            excluded_by_file.setdefault(str(path), set()).update(
+                (weight_key, scale_key)
+            )
+        self._runtime.bind_engram_modules(modules)
+        self._sync_runtime()
+        return excluded_by_file
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         """Apply the mandatory wo_a FP8-at-rest -> dense-bf16 exception.
 
-        Every other packed weight is passed through unchanged: the general
-        dense/expert packed-weight loading and key remapping strategy is
-        explicitly deferred to the base-decode-architecture slice (see
-        class docstring), not faked here. Fails closed if a wo_a.weight is
+        Every other packed weight is passed through unchanged. Fails closed if a wo_a.weight is
         present without its paired .scale (or vice versa), and via
         dequantize_wo_a if the weight is not evenly tiled by one of the
         official square 32/128 block sizes on both axes.
