@@ -398,16 +398,16 @@ class TestDeepseekV41QuantPrimitives(unittest.TestCase):
         with self.assertRaises(ValueError):
             dequantize_wo_a(weight, scale)
 
-    def test_wo_a_dequant_accepts_real_out_axis_tail(self):
-        # wo_a's out axis (rows) may end in a genuine partial block, using
-        # the same ceildiv(out_dim, block) grid as the general FP8
-        # primitive's explicit-block_size path; the in axis must still
-        # divide the block size exactly.
+    def test_wo_a_dequant_rejects_out_axis_tail(self):
+        # convert.py never ceil-divides a wo_a axis: a genuine out-axis
+        # (row) partial tail -- out_dim=40 is not a multiple of
+        # block_size=32, so a naive ceildiv(40, 32) == 2 out-block grid
+        # -- is not an official (32, 32)/(128, 128) square tile and must
+        # fail closed rather than silently zero-pad the tail row.
         weight = mx.zeros((40, 32), dtype=mx.uint8)
         scale = mx.array([[127], [128]], dtype=mx.uint8)  # ceildiv(40, 32) == 2
-        out = dequantize_wo_a(weight, scale)
-        self.assertEqual(out.shape, (40, 32))
-        self.assertEqual(out.dtype, mx.bfloat16)
+        with self.assertRaises(ValueError):
+            dequantize_wo_a(weight, scale)
 
     def test_wo_a_dequant_rejects_undersized_real_byte_tile(self):
         # wo_a shares convert.py exact dequant math with the general FP8
@@ -501,32 +501,26 @@ class TestDeepseekV41QuantPrimitives(unittest.TestCase):
         with self.assertRaises(ValueError):
             dequantize_fp4_block(packed, scale, block_size=32)
 
-    def test_fp4_block_dequant_real_partial_tail_group(self):
-        # A genuine, independently-calculated partial tail: 40 unpacked
-        # elements (20 packed bytes) with block_size=32 produces a real
-        # 8-element tail group (ceildiv(40, 32) == 2, not a second full
-        # 32-element block). Byte layout/expected values were
-        # independently hand-decoded via the official low/high nibble
-        # order and the FP4_E2M1_TABLE magnitude table.
+    def test_fp4_block_dequant_rejects_indivisible_reduction_dim(self):
+        # fp4_act_quant/fp4_gemm never ceil-divide or pad the logical
+        # reduction dimension: 40 unpacked elements (20 packed bytes) is
+        # not an exact multiple of block_size=32, so this is not a
+        # supported layout and must fail closed rather than silently
+        # zero-padding an 8-element partial tail group.
         block0_bytes = [0x22] * 16  # 32 elements, all code=2 -> value 1.0
         block1_bytes = [0x21, 0x43, 0x65, 0x97]  # codes [1,2,3,4,5,6,7,9]
         packed = mx.array(block0_bytes + block1_bytes, dtype=mx.uint8).reshape(1, 20)
-        scale = mx.array([[127, 128]], dtype=mx.uint8)  # 1.0, 2.0
+        scale = mx.array([[127, 128]], dtype=mx.uint8)
+        with self.assertRaises(ValueError):
+            dequantize_fp4_block(packed, scale, block_size=32)
 
-        decoded = dequantize_fp4_block(packed, scale, block_size=32, dtype=mx.float32)
-        self.assertEqual(decoded.shape, (1, 40))
-        got = decoded[0].tolist()
-        for g in got[:32]:
-            self.assertAlmostEqual(g, 1.0, places=9)
-        expected_tail = [1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, -1.0]
-        for g, w in zip(got[32:], expected_tail):
-            self.assertAlmostEqual(g, w, places=9)
-
-    def test_fp4_block_dequant_tail_grid_mismatch_fails_closed(self):
-        # A scale grid that does not match the ceil-div tail grid must
-        # still fail closed, not silently accept some other tail shape.
-        packed = mx.zeros((1, 20), dtype=mx.uint8)  # 40 unpacked elements
-        scale = mx.zeros((1, 3), dtype=mx.uint8)  # ceildiv(40, 32) == 2, not 3
+    def test_fp4_block_dequant_rejects_scale_grid_mismatch_on_exact_fit(self):
+        # Even on an exact-fit (evenly divisible) reduction dimension --
+        # 64 unpacked elements (32 packed bytes) with block_size=32 is
+        # exactly 2 groups -- a scale grid that does not match that exact
+        # group count must still fail closed.
+        packed = mx.zeros((1, 32), dtype=mx.uint8)  # 64 unpacked elements
+        scale = mx.zeros((1, 3), dtype=mx.uint8)  # exact grid is 2, not 3
         with self.assertRaises(ValueError):
             dequantize_fp4_block(packed, scale, block_size=32)
 

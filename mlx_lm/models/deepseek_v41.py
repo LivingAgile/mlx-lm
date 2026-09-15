@@ -305,11 +305,13 @@ def dequantize_wo_a(weight: mx.array, scale: mx.array) -> mx.array:
     block-diagonal einsum("bsgd,grd->bsgr", o, wo_a), not a dense matmul,
     so it must be promoted to a real dense tensor once and reused, never
     kept quantized. convert.py additionally asserts the block size is one
-    of 32 or 128; this function enforces the same constraint so an
-    unexpected checkpoint layout fails closed. A real out-axis (row) tail
-    is accepted for either official block size (a ceildiv(out_dim, block)
-    scale-row count), matching dequantize_fp8_block's explicit-block_size
-    tail handling; the in-axis must still divide the block size exactly.
+    of 32 or 128 and requires *both* weight axes to divide that block
+    size exactly, yielding only the official square (32, 32) or
+    (128, 128) scale-grid tile -- convert.py never ceil-divides a wo_a
+    axis, so an out-axis (row) partial tail is not a supported layout
+    any more than an in-axis one; this function enforces the same
+    exact-division constraint on both axes so an unexpected checkpoint
+    layout fails closed instead of silently zero-padding a tail.
     """
     if weight.ndim != 2 or scale.ndim != 2:
         raise ValueError(
@@ -319,16 +321,15 @@ def dequantize_wo_a(weight: mx.array, scale: mx.array) -> mx.array:
     out_dim, in_dim = weight.shape
     n_out_blocks, n_in_blocks = scale.shape
     for block in _WO_A_BLOCK_SIZES:
-        if in_dim % block:
+        if out_dim % block or in_dim % block:
             continue
-        expected_n_in_blocks = in_dim // block
-        expected_n_out_blocks = -(-out_dim // block)  # ceil division
-        if (n_out_blocks, n_in_blocks) == (expected_n_out_blocks, expected_n_in_blocks):
-            return dequantize_fp8_block(weight, scale, block_size=block, dtype=mx.bfloat16)
+        if (n_out_blocks, n_in_blocks) == (out_dim // block, in_dim // block):
+            return dequantize_fp8_block(weight, scale, dtype=mx.bfloat16)
     raise ValueError(
         f"wo_a scale shape {scale.shape} for weight shape {weight.shape} does not "
-        f"match either official block size in {_WO_A_BLOCK_SIZES} (an out-axis "
-        "tail is allowed; the in-axis must divide the block size exactly)"
+        f"match either official square block size in {_WO_A_BLOCK_SIZES} (both "
+        "axes must divide the block size exactly; convert.py never accepts a "
+        "partial tail on either axis)"
     )
 
 
@@ -369,33 +370,34 @@ def dequantize_fp4_block(
     (logical, unpacked) axis, independent per row -- unlike the 2-D-tiled
     FP8 scheme in dequantize_fp8_block.
 
-    The last (unpacked) axis is allowed a genuine partial tail group: the
-    expected scale-grid size is ceildiv(in_dim, block_size), matching the
-    official act_quant/fp4_act_quant group count. A tail group real region
-    is zero-padded up to block_size before the per-group scale multiply
-    and sliced back off afterwards, so the real elements are bit-for-bit
-    identical to an exact-fit block.
+    The last (unpacked, logical reduction) axis must divide block_size
+    exactly: fp4_act_quant/fp4_gemm never ceil-divide or pad this
+    dimension, so an in_dim that is not an exact multiple of block_size
+    is not a supported layout and fails closed rather than silently
+    zero-padding a partial tail group onto a reduction dimension.
     """
     codes = unpack_fp4_e2m1(packed)
     lead = codes.shape[:-1]
     in_dim = codes.shape[-1]
-    n_blocks = -(-in_dim // block_size)  # ceil division: allow a partial tail group
+    if in_dim % block_size:
+        raise ValueError(
+            f"in_dim {in_dim} is not evenly divisible by block_size={block_size}; "
+            "fp4_act_quant/fp4_gemm require the logical reduction dimension to "
+            "divide the block size exactly (no partial tail group is supported)"
+        )
+    n_blocks = in_dim // block_size
     if tuple(scale.shape) != (*lead, n_blocks):
         raise ValueError(
             f"expected one E8M0 scale per {block_size}-element group "
-            f"(ceil-div grid size {n_blocks}), got scale shape {scale.shape} "
+            f"({n_blocks} groups), got scale shape {scale.shape} "
             f"for unpacked shape {codes.shape}"
         )
-    pad_in = n_blocks * block_size - in_dim
     values = decode_fp4_e2m1_codes(codes)
-    if pad_in:
-        pad_width = [(0, 0)] * (values.ndim - 1) + [(0, pad_in)]
-        values = mx.pad(values, pad_width)
     s = decode_e8m0_scale(scale)
     values = values.reshape(*lead, n_blocks, block_size)
     values = values * mx.expand_dims(s, -1)
     values = values.reshape(*lead, n_blocks * block_size)
-    return values[..., :in_dim].astype(dtype)
+    return values.astype(dtype)
 
 
 class Model(nn.Module):
@@ -439,8 +441,8 @@ class Model(nn.Module):
         explicitly deferred to the base-decode-architecture slice (see
         class docstring), not faked here. Fails closed if a wo_a.weight is
         present without its paired .scale (or vice versa), and via
-        dequantize_wo_a if the scale block size is not one of the
-        official 32/128 block sizes (an out-axis tail is allowed).
+        dequantize_wo_a if the weight is not evenly tiled by one of the
+        official square 32/128 block sizes on both axes.
         """
         weights = dict(weights)
         wo_a_weight_keys = [k for k in weights if k.endswith("wo_a.weight")]
