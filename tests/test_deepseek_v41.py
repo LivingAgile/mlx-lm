@@ -1633,7 +1633,8 @@ class TestDeepseekV41HyperConnections(unittest.TestCase):
         # Distinct keys so attn/ffn coefficient tensors cannot collapse to the
         # same draw if the PRNG does not advance between calls.
         for i, name in enumerate(("hc_attn_fn", "hc_ffn_fn", "hc_attn_base", "hc_ffn_base")):
-            setattr(hc, name, mx.random.normal(getattr(hc, name).shape, key=seed + i + 1))
+            key = mx.random.key(seed + i + 1)
+            setattr(hc, name, mx.random.normal(getattr(hc, name).shape, key=key))
         hc.hc_attn_scale = mx.array([0.5, 0.5, 0.5], dtype=mx.float32)
         hc.hc_ffn_scale = mx.array([0.5, 0.5, 0.5], dtype=mx.float32)
         return config, hc
