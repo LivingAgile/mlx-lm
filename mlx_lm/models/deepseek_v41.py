@@ -4978,8 +4978,9 @@ class Model(nn.Module):
     DeepseekV41HyperConnections, DeepseekV41MoE and the sparse Engram path
     (DeepseekV41Engram over a file-backed DeepseekV41EngramEmbedding). The
     glue that would turn them into an end-to-end model (the
-    Block/Transformer glue joining them, plus DSpark/MTP) is still out of
-    scope. Vision/aligner is implemented as DeepseekV41Vision, independently
+    Block/Transformer glue joining them) is still out of scope. DSpark/MTP is
+    implemented as the isolated DeepseekV41DSpark.forward_spec path, without
+    inventing a speculative serving driver. Vision/aligner is implemented as DeepseekV41Vision, independently
     of this class; __call__ still raises rather than faking a result. Loading real checkpoint weights
     against this Model will fail closed (a strict tensor-name/shape
     mismatch), which is the correct, honest outcome until the deferred
@@ -5001,7 +5002,7 @@ class Model(nn.Module):
             "Engram path (EngramNgramHasher -> BoundedEngramRowCache over "
             "a SafetensorsEngramRowStore -> DeepseekV41EngramEmbedding -> "
             "DeepseekV41Engram). Still deferred: the Block/Transformer "
-            "glue that joins them, and DSpark/MTP. Vision/aligner "
+            "glue that joins them. Isolated DSpark/MTP forward_spec and vision/aligner "
             "token-budget arithmetic is implemented as DeepseekV41Vision."
         )
 

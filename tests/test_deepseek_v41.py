@@ -63,8 +63,8 @@ from mlx_lm.models.deepseek_v41 import (
     FP4_WEIGHT_BLOCK_SIZE,
     BoundedEngramRowCache,
     DeepseekV41AttentionStack,
+    DeepseekV41DSpark,
     DeepseekV41Engram,
-        DeepseekV41DSpark,
     DeepseekV41EngramEmbedding,
     DeepseekV41Expert,
     DeepseekV41Gate,
@@ -96,13 +96,13 @@ from mlx_lm.models.deepseek_v41 import (
     dequantize_engram_rows,
     dequantize_fp4_block,
     dequantize_fp8_block,
-        get_dspark_topk_idxs,
     dequantize_wo_a,
     deterministic_topk_indices,
     engram_compressed_token_key,
     engram_signed_sqrt_sigmoid_gate,
     expand_hyper_connection_stream,
     find_next_prime,
+    get_dspark_topk_idxs,
     image_token_types,
     fp4_act_quant_roundtrip,
     llm_grid,
@@ -1428,12 +1428,12 @@ def _tiny_dspark_text_config(**overrides):
             "num_nextn_predict_layers": 3,
             "compress_ratios": [0] * 7,
             "n_routed_experts": 8,
-            "num_experts_per_tok": 3,
+            "num_experts_per_tok": 2,
             "dspark_block_size": 2,
             "dspark_noise_token_id": 63,
             "dspark_target_layer_ids": [1, 3],
             "dspark_markov_rank": 8,
-            "dspark_n_routed_experts": 8,
+            "dspark_n_routed_experts": 16,
             "dspark_num_experts_per_tok": 3,
             "num_attention_heads": 4,
             "head_dim": 32,
@@ -3580,22 +3580,33 @@ class TestDeepseekV41ImageGrid(unittest.TestCase):
 
 class TestDeepseekV41DSpark(unittest.TestCase):
     def test_topk_indices_join_main_window_and_draft_block(self):
-        actual = np.asarray(get_dspark_topk_idxs(4, 2, 2, 3))
-        self.assertEqual(actual.shape, (2, 2, 6))
-        self.assertTrue(np.array_equal(actual[0, 0], np.arange(6)))
+        actual = np.asarray(get_dspark_topk_idxs(4, 2, 2, 1))
+        self.assertEqual(actual.shape, (2, 2, 4))
+        self.assertTrue(np.array_equal(actual[0, 0], [0, 1, 4, 5]))
         with self.assertRaises(ValueError):
             get_dspark_topk_idxs(4, 1, 2, 0)
 
     def test_forward_spec_prefill_then_decode_matches_official_shapes(self):
         config = _tiny_dspark_text_config()
         model = DeepseekV41DSpark(config, temperature=0)
-        prefill_hidden = mx.zeros((1, 4, 64), dtype=mx.float32)
+        first = model.mtp[0]
+        first.main_proj.weight = mx.full(
+            first.main_proj.weight.shape, 0x38, dtype=mx.uint8
+        )
+        first.main_proj.scale = mx.full(
+            first.main_proj.scale.shape, 127, dtype=mx.uint8
+        )
+        for layer in model.mtp:
+            layer.attn.wkv.weight = mx.eye(32, dtype=mx.float32)
+        prefill_hidden = mx.arange(256, dtype=mx.float32).reshape(1, 4, 64) / 256
         self.assertIsNone(
             model.forward_spec(mx.array([7], dtype=mx.int32), prefill_hidden)
         )
+        for layer in model.mtp:
+            self.assertGreater(float(mx.max(mx.abs(layer.cache.window))), 0.0)
         result = model.forward_spec(
             mx.array([8], dtype=mx.int32),
-            mx.zeros((1, 1, 64), dtype=mx.float32),
+            mx.arange(64, dtype=mx.float32).reshape(1, 1, 64) / 64,
             start_pos=4,
         )
         output_ids, logits, confidence = result
@@ -3603,6 +3614,37 @@ class TestDeepseekV41DSpark(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 2, 64))
         self.assertEqual(confidence.shape, (1, 2))
         self.assertEqual(int(output_ids[0, 0]), 8)
+
+    def test_stage_contract_names_and_dspark_specific_routing(self):
+        model = DeepseekV41DSpark(_tiny_dspark_text_config())
+        self.assertEqual(model.mtp[0].ffn.n_routed_experts, 16)
+        self.assertEqual(model.mtp[0].ffn.topk, 3)
+        names = {name for name, _ in tree_flatten(model.parameters())}
+        self.assertIn("mtp.0.main_proj.weight", names)
+        self.assertIn("mtp.0.main_norm.weight", names)
+        self.assertIn("mtp.2.markov_head.embed.weight", names)
+        self.assertIn("mtp.2.markov_head.head.weight", names)
+        self.assertIn("mtp.2.confidence_head.proj.weight", names)
+
+    def test_markov_logits_and_confidence_use_the_official_inputs(self):
+        model = DeepseekV41DSpark(_tiny_dspark_text_config())
+        final = model.mtp[-1]
+        markov = final.markov_head
+        markov.embed.weight = mx.zeros(markov.embed.weight.shape, dtype=mx.float32)
+        markov.embed.weight[5] = mx.arange(1, 9, dtype=mx.float32)
+        markov.head.weight = mx.zeros(markov.head.weight.shape, dtype=mx.float32)
+        markov.head.weight[2] = mx.ones((8,), dtype=mx.float32)
+        logits, embed = markov(mx.array([5], dtype=mx.int32))
+        self.assertTrue(np.array_equal(np.asarray(embed[0]), np.arange(1, 9)))
+        self.assertEqual(float(logits[0, 2]), 36.0)
+
+        final.confidence_head.proj.weight = mx.concatenate(
+            [mx.ones((1, 32)), mx.full((1, 8), 2.0)], axis=-1
+        )
+        hidden = mx.ones((1, 2, 32), dtype=mx.float32)
+        markov_embed = mx.full((1, 2, 8), 3.0, dtype=mx.float32)
+        confidence = final.confidence_head(hidden, markov_embed)
+        self.assertTrue(np.array_equal(np.asarray(confidence), [[80.0, 80.0]]))
 
     def test_malformed_dspark_config_fails_closed(self):
         with self.assertRaises(ValueError):
