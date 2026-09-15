@@ -2350,6 +2350,59 @@ class TestDeepseekV41ExpertPartition(unittest.TestCase):
         self.assertFalse(np.allclose(np.asarray(shared), 0.0))
         self.assertTrue(np.allclose(np.asarray(out), np.asarray(expected), atol=1e-5))
 
+    def test_moe_output_matches_at_world_sizes_one_two_and_four(self):
+        config = _tiny_moe_text_config()
+        x = mx.arange(3 * config.hidden_size, dtype=mx.float32).reshape(
+            1, 3, config.hidden_size
+        ) / 128
+
+        def initialize(moe):
+            moe.gate.weight = mx.zeros(moe.gate.weight.shape, dtype=mx.float32)
+            moe.gate.bias = mx.array(
+                [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+                dtype=mx.float32,
+            )
+            for expert_id in moe.local_expert_ids:
+                expert = moe.expert(expert_id)
+                for index, linear in enumerate((expert.w1, expert.w2, expert.w3)):
+                    linear.weight = mx.full(
+                        linear.weight.shape,
+                        0.001 * (expert_id + 1) * (index + 1),
+                        dtype=mx.float32,
+                    )
+            _zero_expert(moe.shared_experts)
+            return moe
+
+        whole = initialize(
+            DeepseekV41MoE(
+                config,
+                expert_quant=None,
+                shared_expert_quant=None,
+                dtype=mx.float32,
+            )
+        )(x)
+
+        for world_size in (2, 4):
+            partials = []
+            for rank in range(world_size):
+                moe = initialize(
+                    DeepseekV41MoE(
+                        config,
+                        world_size=world_size,
+                        rank=rank,
+                        all_reduce=lambda local: local,
+                        expert_quant=None,
+                        shared_expert_quant=None,
+                        dtype=mx.float32,
+                    )
+                )
+                partials.append(moe(x))
+            sharded = sum(partials[1:], start=partials[0])
+            self.assertTrue(
+                mx.allclose(sharded, whole, atol=1e-5, rtol=1e-5).item(),
+                world_size,
+            )
+
     def test_sharded_moe_rejects_an_in_place_reducer_that_returns_none(self):
         config = _tiny_moe_text_config()
         moe = DeepseekV41MoE(
@@ -3396,20 +3449,28 @@ class TestDeepseekV41EngramEmbedding(unittest.TestCase):
         self.assertTrue(np.all(left[0, 1] == 0.0))  # row 40 belongs to rank 1
         self.assertTrue(np.all(right[0, 0] == 0.0))  # row 5 belongs to rank 0
 
-    def test_summing_the_shards_reproduces_the_unsharded_lookup(self):
+    def test_summing_one_two_and_four_rank_shards_reproduces_the_lookup(self):
         """This is what the injected all-reduce is for: each rank contributes
         only its own rows, and the sum is the whole lookup."""
         identity = lambda rows: rows
         whole = self._embedding(0, 64)
-        rank0 = self._embedding(0, 32, rank=0, world_size=2, all_reduce=identity)
-        rank1 = self._embedding(32, 64, rank=1, world_size=2, all_reduce=identity)
         ids = np.array([[5, 40, 63, 0]], dtype=np.int64)
-        summed = np.asarray(rank0(ids, dtype=mx.float32)) + np.asarray(
-            rank1(ids, dtype=mx.float32)
-        )
-        self.assertTrue(
-            np.array_equal(summed, np.asarray(whole(ids, dtype=mx.float32)))
-        )
+        expected = np.asarray(whole(ids, dtype=mx.float32))
+        for world_size in (2, 4):
+            rows_per_rank = 64 // world_size
+            shards = [
+                self._embedding(
+                    rank * rows_per_rank,
+                    (rank + 1) * rows_per_rank,
+                    rank=rank,
+                    world_size=world_size,
+                    all_reduce=identity,
+                )
+                for rank in range(world_size)
+            ]
+            partials = [np.asarray(shard(ids, dtype=mx.float32)) for shard in shards]
+            summed = sum(partials[1:], start=partials[0])
+            self.assertTrue(np.array_equal(summed, expected), world_size)
 
     def test_the_injected_reducer_is_the_only_cross_rank_coupling(self):
         calls = []
