@@ -188,6 +188,41 @@ class TestUtils(unittest.TestCase):
         )
         self.assertTrue(mx.array_equal(model.keep, keep))
 
+    def test_load_model_prepares_model_specific_sharding_before_file_exclusions(self):
+        events = []
+
+        class _Args:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class _Model(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+                self.keep = mx.zeros((3,), dtype=mx.uint8)
+
+            def prepare_sharded_load(self, group):
+                events.append(("shard", group))
+
+            def prepare_file_backed_weights(self, model_path, weight_files):
+                events.append(("files", events[-1][0]))
+                return {}
+
+        path = Path(self.test_dir) / "model-00001-of-00001.safetensors"
+        mx.save_safetensors(str(path), {"keep": mx.array([2, 3, 5], dtype=mx.uint8)})
+        with open(Path(self.test_dir) / "config.json", "w") as handle:
+            json.dump({"model_type": "test"}, handle)
+        group = object()
+
+        model, _ = utils.load_model(
+            Path(self.test_dir),
+            get_model_classes=lambda config: (_Model, _Args),
+            shard_group=group,
+        )
+
+        self.assertEqual(events, [("shard", group), ("files", "shard")])
+        self.assertTrue(mx.array_equal(model.keep, mx.array([2, 3, 5], dtype=mx.uint8)))
+
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
         from mlx_lm.models import gemma4
 

@@ -370,6 +370,7 @@ def load_model(
     strict: bool = True,
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
+    shard_group=None,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -386,6 +387,8 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the ``_get_classes`` function.
+        shard_group: Optional distributed group for models that must establish
+            rank-local ownership before tensor loading.
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
@@ -422,6 +425,8 @@ def load_model(
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
+    if shard_group is not None and hasattr(model, "prepare_sharded_load"):
+        model.prepare_sharded_load(shard_group)
 
     excluded_by_file = {}
     if hasattr(model, "prepare_file_backed_weights"):
@@ -676,9 +681,12 @@ def sharded_load(
         tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, _ = load_model(
+        model_path, lazy=True, strict=False, shard_group=tensor_group
+    )
     if tensor_group is not None:
-        model.shard(tensor_group)
+        if not hasattr(model, "prepare_sharded_load"):
+            model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
     mx.eval(model.parameters())

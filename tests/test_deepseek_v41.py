@@ -2902,6 +2902,16 @@ class TestDeepseekV41EngramRowStore(unittest.TestCase):
         self.assertTrue(np.array_equal(weight, self.weight[wanted]))
         self.assertTrue(np.array_equal(scale, self.scale[wanted]))
 
+    def test_rank_local_rows_map_to_their_physical_file_range(self):
+        store = self._store(row_start=32, num_rows=32)
+        wanted = [0, 7, 31]
+        weight, scale = store.read_rows(wanted)
+        physical = [32, 39, 63]
+        self.assertTrue(np.array_equal(weight, self.weight[physical]))
+        self.assertTrue(np.array_equal(scale, self.scale[physical]))
+        with self.assertRaises(IndexError):
+            store.read_rows([32])
+
     def test_cost_is_counted_and_is_per_row_not_per_file(self):
         store = self._store()
         store.read_rows([1, 2, 3])
@@ -3999,6 +4009,60 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             if name.startswith("layers.0.ffn.experts.")
         }
         self.assertEqual(expert_ids, {4, 5, 6, 7})
+
+    def test_preload_sharding_excludes_remote_experts_and_shards_engram_rows(self):
+        class Group:
+            def size(self):
+                return 2
+
+            def rank(self):
+                return 1
+
+        config = _full_config_dict()
+        text = asdict(self._args().text_config) | {
+            "engram_layer_ids": [0],
+            "engram_num_embeddings": [408],
+            "engram_max_ngram_size": 3,
+            "engram_vocab_size": 97,
+            "engram_n_heads": 2,
+            "engram_head_dim": 32,
+            "engram_pad_token_id": 2,
+            "engram_compressed_vocab_size": 11,
+        }
+        config["text_config"] = text
+        config["vision_config"] = _vision_config_dict() | {"num_hidden_layers": 0}
+        model = Model(ModelArgs.from_dict(config))
+        model.prepare_sharded_load(Group())
+        weight, scale = _random_engram_shard(408, 32, 32, seed=19)
+
+        def add_experts(header):
+            template = dict(header["layers.0.engram.embed.weight"])
+            header["layers.0.ffn.experts.0.w1.weight"] = dict(template)
+            header["layers.0.ffn.experts.4.w1.weight"] = dict(template)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model-00001-of-00001.safetensors"
+            _write_engram_fixture(
+                path,
+                weight,
+                scale,
+                weight_key="layers.0.engram.embed.weight",
+                scale_key="layers.0.engram.embed.scale",
+                mutate=add_experts,
+            )
+            excluded = model.prepare_file_backed_weights(Path(tmp), [path])
+            excluded_names = excluded[str(path.resolve())]
+            self.assertIn("layers.0.ffn.experts.0.w1.weight", excluded_names)
+            self.assertNotIn("layers.0.ffn.experts.4.w1.weight", excluded_names)
+            embedding = model.layers[0].engram.embed
+            self.assertEqual(embedding.cache.store.row_start, 204)
+            self.assertEqual(embedding.cache.store.num_rows, 204)
+            self.assertTrue(
+                np.array_equal(
+                    embedding.cache.store.read_rows([0])[0][0], weight[204]
+                )
+            )
+            embedding.cache.store.close()
 
     def test_file_backed_loader_claims_only_the_engram_table_payloads(self):
         config = _full_config_dict()

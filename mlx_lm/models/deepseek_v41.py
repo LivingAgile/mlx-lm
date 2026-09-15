@@ -3850,6 +3850,8 @@ class SafetensorsEngramRowStore(EngramRowStore):
         weight_key: str = "weight",
         scale_key: str = "scale",
         block_size: int = ENGRAM_FP8_BLOCK_SIZE,
+        row_start: int = 0,
+        num_rows: Optional[int] = None,
     ):
         if block_size < 1:
             raise ValueError(f"block_size must be positive, got {block_size}")
@@ -3896,8 +3898,8 @@ class SafetensorsEngramRowStore(EngramRowStore):
         scale_shape, scale_begin = self._entry(
             header, self.scale_key, ENGRAM_SCALE_SAFETENSORS_DTYPES, file_size
         )
-        self.num_rows, self.dim = weight_shape
-        if self.num_rows < 1 or self.dim < 1:
+        self.full_num_rows, self.dim = weight_shape
+        if self.full_num_rows < 1 or self.dim < 1:
             raise ValueError(
                 f"{self.path}:{self.weight_key} has an empty shape {weight_shape}"
             )
@@ -3906,13 +3908,21 @@ class SafetensorsEngramRowStore(EngramRowStore):
                 f"{self.path}:{self.weight_key} row width {self.dim} is not "
                 f"divisible by block_size={self.block_size}"
             )
-        expected_scale = (self.num_rows, self.dim // self.block_size)
+        expected_scale = (self.full_num_rows, self.dim // self.block_size)
         if tuple(scale_shape) != expected_scale:
             raise ValueError(
                 f"{self.path}:{self.scale_key} has shape {tuple(scale_shape)} but "
-                f"the [{self.num_rows}, {self.dim}] weight at "
+                f"the [{self.full_num_rows}, {self.dim}] weight at "
                 f"block_size={self.block_size} requires {expected_scale}"
             )
+        self.row_start = int(row_start)
+        self.num_rows = self.full_num_rows if num_rows is None else int(num_rows)
+        if self.row_start < 0 or self.row_start >= self.full_num_rows:
+            raise ValueError(
+                f"row_start {self.row_start} is outside the {self.full_num_rows}-row table"
+            )
+        if self.num_rows < 1:
+            raise ValueError(f"num_rows must be positive, got {self.num_rows}")
         self._weight_begin = self._data_start + weight_begin
         self._scale_begin = self._data_start + scale_begin
 
@@ -3970,8 +3980,14 @@ class SafetensorsEngramRowStore(EngramRowStore):
                 f"row ids [{int(ids.min())}, {int(ids.max())}] fall outside "
                 f"[0, num_rows={self.num_rows}) of {self.path}"
             )
+        physical_ids = ids + self.row_start
+        if int(physical_ids.max()) >= self.full_num_rows:
+            raise IndexError(
+                f"local row {int(ids.max())} maps past the physical "
+                f"{self.full_num_rows}-row table"
+            )
         handle = self._file()
-        for position, row_id in enumerate(ids.tolist()):
+        for position, row_id in enumerate(physical_ids.tolist()):
             handle.seek(self._weight_begin + row_id * self.dim)
             chunk = handle.read(self.dim)
             if len(chunk) != self.dim:
@@ -5235,10 +5251,16 @@ class Model(nn.Module):
     def shard(self, group=None):
         group = group or mx.distributed.init()
         self._sync_runtime()
+        self._shard_world_size = group.size()
+        self._shard_rank = group.rank()
+        self._shard_group = group
         for layer in self.layers:
             layer.ffn.shard(group)
         for layer in self.mtp:
             layer.ffn.shard(group)
+
+    def prepare_sharded_load(self, group):
+        self.shard(group)
 
     def bind_engram(self, hasher, modules):
         self._runtime.bind_engram(hasher, modules)
@@ -5269,7 +5291,10 @@ class Model(nn.Module):
     def prepare_file_backed_weights(self, model_path, weight_files):
         """Bind official Engram tables by path and exclude their payloads from MLX."""
         layout = self._runtime.engram_layout
-        if layout is None:
+        world_size = getattr(self, "_shard_world_size", 1)
+        rank = getattr(self, "_shard_rank", 0)
+        group = getattr(self, "_shard_group", None)
+        if layout is None and world_size == 1:
             return {}
         weight_files = [Path(path).resolve() for path in weight_files]
         tensor_files = {}
@@ -5291,6 +5316,23 @@ class Model(nn.Module):
                     tensor_files[name] = path
 
         excluded_by_file = {}
+        if world_size > 1:
+            for name, path in tensor_files.items():
+                match = re.match(
+                    r"^(layers|mtp)\.(\d+)\.ffn\.experts\.(\d+)\.", name
+                )
+                if match is None:
+                    continue
+                blocks = self.layers if match.group(1) == "layers" else self.mtp
+                block_id = int(match.group(2))
+                expert_id = int(match.group(3))
+                if (
+                    block_id >= len(blocks)
+                    or blocks[block_id].ffn.experts[expert_id] is None
+                ):
+                    excluded_by_file.setdefault(str(path), set()).add(name)
+        if layout is None:
+            return excluded_by_file
         modules = {}
         for layer_id, num_embeddings in zip(
             layout.layer_ids, layout.num_embeddings
@@ -5308,17 +5350,30 @@ class Model(nn.Module):
                     f"{weight_key} and {scale_key} must share one safetensors file"
                 )
             store = SafetensorsEngramRowStore(
-                str(path), weight_key=weight_key, scale_key=scale_key
+                str(path),
+                weight_key=weight_key,
+                scale_key=scale_key,
+                row_start=rank * (-(-num_embeddings // world_size)),
+                num_rows=-(-num_embeddings // world_size),
             )
-            if store.num_rows != num_embeddings or store.dim != layout.head_dim:
+            if store.full_num_rows != num_embeddings or store.dim != layout.head_dim:
                 store.close()
                 raise ValueError(
-                    f"{weight_key} has shape {(store.num_rows, store.dim)} but "
+                    f"{weight_key} has shape {(store.full_num_rows, store.dim)} but "
                     f"the config requires {(num_embeddings, layout.head_dim)}"
                 )
             cache = BoundedEngramRowCache(store)
             embedding = DeepseekV41EngramEmbedding(
-                num_embeddings, layout.head_dim, cache
+                num_embeddings,
+                layout.head_dim,
+                cache,
+                rank=rank,
+                world_size=world_size,
+                all_reduce=(
+                    None
+                    if world_size == 1
+                    else lambda value: mx.distributed.all_sum(value, group=group)
+                ),
             )
             modules[layer_id] = DeepseekV41Engram(
                 self.args.text_config, layer_id, layout, embedding
