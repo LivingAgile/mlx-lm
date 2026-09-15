@@ -5015,6 +5015,7 @@ class DeepseekV41Transformer(nn.Module):
         super().__init__()
         config = args.text_config
         self.config = config
+        self.dim = config.hidden_size
         self.hc_mult = config.hc_mult
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
         self.engram_layout = validate_engram_config(config)

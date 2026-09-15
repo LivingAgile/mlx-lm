@@ -47,6 +47,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 
 import mlx.core as mx
@@ -4034,6 +4035,28 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "config requires"):
                 small.prepare_file_backed_weights(Path(tmp), [path])
+
+    def test_registered_model_merges_an_actual_image_span(self):
+        args = self._args()
+        config = _full_config_dict()
+        config["text_config"] = asdict(args.text_config)
+        config["vision_config"] = _vision_config_dict() | {
+            "num_hidden_layers": 1,
+            "hidden_size": 16,
+            "num_attention_heads": 2,
+            "intermediate_size": 32,
+            "patch_size": 2,
+            "downsample_ratio": 2,
+            "max_image_tokens": 64,
+            "min_pixels": 16,
+        }
+        model = Model(ModelArgs.from_dict(config))
+        stream = mx.ones((1, 4, 32), dtype=mx.float32)
+        patches = mx.zeros((4, 3, 2, 2), dtype=mx.float32)
+        image = ImageInput(0, patches, 2, 2, image_token_types(1, 1))
+        merged = model._runtime.merge_image_embeddings([[image]], stream)
+        self.assertEqual(merged.shape, stream.shape)
+        self.assertFalse(mx.allclose(merged, stream))
 
 
 if __name__ == "__main__":
