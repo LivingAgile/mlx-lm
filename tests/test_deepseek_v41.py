@@ -27,37 +27,69 @@ rather than the official 384 x 2304 x 5120 stack, which no assertion here
 needs allocated. The one place the official numbers appear directly is the
 gate itself (384 routed / 6 active), whose projection is small enough to
 build.
+
+The Engram tests below run the real production sparse-lookup path. The prime
+bucket layout and hash multipliers are checked against the *pinned* config, so
+the two 384-million-row tables are exercised as arithmetic; every gather runs
+against a tiny real safetensors fixture written by the test itself, because the
+production row store addresses rows by byte range and is therefore
+table-size-independent by construction. No test here allocates, loads or
+implies a dense ``[num_embeddings, head_dim]`` tensor -- the official pair is
+~91.6 GiB and ~98.3 GiB -- and TestDeepseekV41EngramMemoryBounds asserts that
+property directly by holding the measured gather cost constant across fixtures
+that differ 16x in size.
 """
+import json
+import os
+import tempfile
 import unittest
 
 import mlx.core as mx
+import numpy as np
 from mlx.utils import tree_flatten
 
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.deepseek_v41 import (
     COMPRESS_KV_FP4_BLOCK_SIZE,
+    ENGRAM_FP8_BLOCK_SIZE,
+    ENGRAM_GATE_CLAMP,
+    ENGRAM_NORMALIZER_SEQUENCE,
+    ENGRAM_SPACE_SENTINEL,
     FP4_E2M1_TABLE,
     FP4_WEIGHT_BLOCK_SIZE,
+    BoundedEngramRowCache,
     DeepseekV41AttentionStack,
+    DeepseekV41Engram,
+    DeepseekV41EngramEmbedding,
     DeepseekV41Expert,
     DeepseekV41Gate,
     DeepseekV41HyperConnections,
     DeepseekV41MoE,
     DeepseekV41PackedLinear,
-    ModelArgs,
+    EngramLayout,
+    EngramNgramHasher,
     Model,
+    ModelArgs,
     PhysicalLatentCache,
     QuantizationConfig,
+    SafetensorsEngramRowStore,
     TextConfig,
     VisionConfig,
     act_quant_roundtrip,
     apply_rope_tail,
+    build_engram_compressed_token_map,
+    build_engram_compressed_token_map_from_tokenizer,
+    compute_engram_hash_multipliers,
     decode_e8m0_scale,
+    dequantize_engram_rows,
     dequantize_fp4_block,
     dequantize_fp8_block,
     dequantize_wo_a,
     deterministic_topk_indices,
+    engram_compressed_token_key,
+    engram_signed_sqrt_sigmoid_gate,
     expand_hyper_connection_stream,
+    find_next_prime,
     fp4_act_quant_roundtrip,
     hc_post,
     hc_pre,
@@ -65,6 +97,7 @@ from mlx_lm.models.deepseek_v41 import (
     make_deepseek_v41_attention_caches,
     make_identity_pre_mix,
     noaux_tc_route,
+    normalize_engram_token_text,
     resolve_attention_layer_policies,
     rope_cos_sin,
     routed_expert_partition,
@@ -72,6 +105,7 @@ from mlx_lm.models.deepseek_v41 import (
     select_candidate_blocks,
     sparse_attn,
     unpack_fp4_e2m1,
+    validate_engram_config,
     validate_moe_routing_config,
     window_topk_idxs,
     yarn_rope_frequencies,
@@ -2220,6 +2254,1184 @@ class TestDeepseekV41RoutingConfigValidation(unittest.TestCase):
             validate_moe_routing_config(_tiny_moe_text_config(n_shared_experts=3), 8, 3)
         self.assertIn("shared", str(ctx.exception).lower())
 
+
+def _engram_text_config(**overrides):
+    """A tiny but structurally faithful Engram config.
+
+    Two Engram layers with distinct tables, 3-grams over 2 heads (so
+    n_hash_cols == 4, the same (max_ngram_size - 1) * n_heads shape the
+    official 4-gram/8-head config produces as 24), and a 32-wide row that is
+    exactly one E8M0 block. The two table row counts are filled in from the
+    prime layout itself, so the tiny config tiles its tables exactly the way
+    the official one does.
+    """
+    cfg = _text_config_dict()
+    cfg.update(
+        {
+            "vocab_size": 40,
+            "hidden_size": 8,
+            "num_hidden_layers": 8,
+            "num_nextn_predict_layers": 0,
+            "compress_ratios": [0, 0, 2, 2, 1, 1, 1, 1],
+            "kv_source_layer_ids": [2, 4],
+            "index_source_layer_ids": [2, 4, 6],
+            "candidate_source_layer_id": 4,
+            "hc_mult": 2,
+            "rms_norm_eps": 1e-6,
+            "engram_layer_ids": [1, 3],
+            "engram_num_embeddings": [10**9, 10**9],
+            "engram_max_ngram_size": 3,
+            "engram_vocab_size": 97,
+            "engram_n_heads": 2,
+            "engram_head_dim": 32,
+            "engram_pad_token_id": 2,
+            "engram_compressed_vocab_size": 11,
+        }
+    )
+    cfg.update(overrides)
+    probe = TextConfig.from_dict(cfg)
+    if "engram_num_embeddings" not in overrides and probe.engram_layer_ids:
+        layout = EngramLayout.from_config(probe)
+        cfg["engram_num_embeddings"] = [
+            layout.bucket_span(i) for i in range(len(layout.layer_ids))
+        ]
+    return TextConfig.from_dict(cfg)
+
+
+_ENGRAM_TOKEN_MAP = [i % 11 for i in range(40)]
+
+
+def _write_engram_fixture(
+    path,
+    weight,
+    scale,
+    weight_dtype="F8_E4M3",
+    scale_dtype="F8_E8M0",
+    mutate=None,
+):
+    """Write a real, tiny safetensors file holding one packed Engram shard.
+
+    The header is built here rather than by a library so the production parser
+    in SafetensorsEngramRowStore is what is under test, and so a malformed
+    header can be produced on purpose via ``mutate``.
+    """
+    weight = np.ascontiguousarray(weight, dtype=np.uint8)
+    scale = np.ascontiguousarray(scale, dtype=np.uint8)
+    header = {
+        "weight": {
+            "dtype": weight_dtype,
+            "shape": list(weight.shape),
+            "data_offsets": [0, weight.nbytes],
+        },
+        "scale": {
+            "dtype": scale_dtype,
+            "shape": list(scale.shape),
+            "data_offsets": [weight.nbytes, weight.nbytes + scale.nbytes],
+        },
+    }
+    if mutate is not None:
+        mutate(header)
+    blob = json.dumps(header).encode("utf-8")
+    blob += b" " * ((-len(blob)) % 8)
+    with open(path, "wb") as handle:
+        handle.write(len(blob).to_bytes(8, "little"))
+        handle.write(blob)
+        handle.write(weight.tobytes())
+        handle.write(scale.tobytes())
+    return path
+
+
+def _random_engram_shard(n_rows, dim, block_size, seed):
+    """Packed bytes for a tiny Engram shard: E4M3 values plus E8M0 row scales.
+
+    Magnitude codes stop below 0x78 so no exponent field reaches 0b1111, which
+    keeps E4M3FN NaN out of the fixture; the sign bit is drawn separately so
+    negative values are still covered. Scale codes stay near the 127 bias, well
+    clear of the E8M0 NaN code.
+    """
+    rng = np.random.default_rng(seed)
+    magnitude = rng.integers(0, 0x78, size=(n_rows, dim), dtype=np.uint8)
+    sign = rng.integers(0, 2, size=(n_rows, dim), dtype=np.uint8) << 7
+    weight = (magnitude | sign).astype(np.uint8)
+    scale = rng.integers(120, 132, size=(n_rows, dim // block_size), dtype=np.uint8)
+    return weight, scale
+
+
+class TestDeepseekV41EngramNormalization(unittest.TestCase):
+    """The compressed-vocabulary contract this repository owns.
+
+    Every Engram hash multiplier is derived from the *size* of the compressed
+    vocabulary, so a divergence in this normalizer chain does not degrade
+    quality gracefully: it silently rehashes both 384-million-row tables.
+    """
+
+    def test_the_declared_sequence_is_the_official_one(self):
+        self.assertEqual(
+            ENGRAM_NORMALIZER_SEQUENCE[:4],
+            ("NFKC", "NFD", "StripAccents", "Lowercase"),
+        )
+        self.assertEqual(len(ENGRAM_NORMALIZER_SEQUENCE), 8)
+
+    def test_case_and_leading_space_collapse(self):
+        for text in (" The", "the", "THE", " THE ", "\tThe\n"):
+            self.assertEqual(normalize_engram_token_text(text), "the")
+
+    def test_accents_are_stripped_after_decomposition(self):
+        # Precomposed and decomposed forms must land on the same key.
+        self.assertEqual(normalize_engram_token_text("caf\u00e9"), "cafe")
+        self.assertEqual(normalize_engram_token_text("cafe\u0301"), "cafe")
+        self.assertEqual(normalize_engram_token_text("\u00c9\u00c0"), "ea")
+
+    def test_compatibility_forms_are_folded(self):
+        self.assertEqual(normalize_engram_token_text("\uff21\uff22"), "ab")
+
+    def test_a_lone_space_survives_the_strip_via_the_sentinel(self):
+        # Without the private-use sentinel this token would strip to the empty
+        # string and merge with every other whitespace-only token.
+        self.assertEqual(normalize_engram_token_text(" "), " ")
+        self.assertEqual(normalize_engram_token_text("\n\t "), " ")
+        self.assertEqual(ENGRAM_SPACE_SENTINEL, "\ue000")
+
+    def test_inner_whitespace_runs_collapse_but_edges_are_trimmed(self):
+        self.assertEqual(normalize_engram_token_text("a \t b"), "a b")
+        self.assertEqual(normalize_engram_token_text("\u00a0x\u00a0"), "x")
+
+    def test_the_empty_string_stays_empty(self):
+        self.assertEqual(normalize_engram_token_text(""), "")
+
+    def test_partial_byte_tokens_are_keyed_by_their_raw_form(self):
+        self.assertEqual(engram_compressed_token_key("\ufffd", "<0xC3>"), "<0xC3>")
+        with self.assertRaises(ValueError):
+            engram_compressed_token_key("\ufffd", None)
+
+    def test_the_map_collapses_equivalent_ids_in_first_seen_order(self):
+        decoded = [
+            " The",
+            "the",
+            "THE",
+            " ",
+            "\n",
+            "caf\u00e9",
+            "cafe",
+            "\ufffd",
+            "\ufffd",
+            "x",
+        ]
+        raw = [None] * 7 + ["<0xC3>", "<0xA9>", None]
+        lookup, size = build_engram_compressed_token_map(decoded, raw)
+        self.assertEqual(lookup, [0, 0, 0, 1, 1, 2, 2, 3, 4, 5])
+        self.assertEqual(size, 6)
+        self.assertEqual(max(lookup) + 1, size)
+
+    def test_a_whitespace_only_token_keeps_its_own_identity(self):
+        lookup, size = build_engram_compressed_token_map(["a", " "], [None, None])
+        self.assertNotEqual(lookup[0], lookup[1])
+        self.assertEqual(size, 2)
+
+    def test_malformed_vocabularies_fail_closed(self):
+        with self.assertRaises(ValueError):
+            build_engram_compressed_token_map(["a", "b"], [None])
+        with self.assertRaises(ValueError):
+            build_engram_compressed_token_map([], [])
+
+    def test_a_slow_tokenizer_is_refused_rather_than_decoded_differently(self):
+        class _NoBackend:
+            def __len__(self):
+                return 4
+
+        with self.assertRaises(ValueError) as ctx:
+            build_engram_compressed_token_map_from_tokenizer(_NoBackend())
+        self.assertIn("backend_tokenizer", str(ctx.exception))
+
+
+class TestDeepseekV41EngramLayout(unittest.TestCase):
+    """Prime bucket layout, checked against the real pinned config."""
+
+    def test_the_official_layout_tiles_both_tables_exactly(self):
+        layout = EngramLayout.from_config(_official_text_config())
+        self.assertEqual(layout.layer_ids, (1, 14))
+        # (max_ngram_size - 1) * n_heads == 3 * 8 == 24 rows per token per layer.
+        self.assertEqual(layout.n_hash_cols, 24)
+        self.assertEqual(layout.prime_array().shape, (2, 3, 8))
+        # The 24 disjoint prime bucket ranges of each layer sum to precisely the
+        # engram_num_embeddings row count the pinned config declares.
+        self.assertEqual(layout.bucket_span(0), 384006168)
+        self.assertEqual(layout.bucket_span(1), 384016682)
+        self.assertEqual(
+            (layout.bucket_span(0), layout.bucket_span(1)), layout.num_embeddings
+        )
+
+    def test_every_bucket_range_is_distinct_and_increasing(self):
+        layout = EngramLayout.from_config(_official_text_config())
+        primes = layout.flat_primes(0) + layout.flat_primes(1)
+        self.assertEqual(list(primes), sorted(primes))
+        self.assertEqual(len(set(primes)), len(primes))
+        self.assertEqual(primes[0], 16000057)
+        self.assertTrue(all(p > 16000000 - 1 for p in primes))
+
+    def test_offsets_concatenate_the_ranges_without_gaps(self):
+        layout = EngramLayout.from_config(_official_text_config())
+        offsets = layout.bucket_offsets()
+        self.assertEqual(offsets.shape, (2, 24))
+        for index in range(2):
+            flat = layout.flat_primes(index)
+            self.assertEqual(int(offsets[index][0]), 0)
+            for column in range(1, 24):
+                self.assertEqual(
+                    int(offsets[index][column]),
+                    int(offsets[index][column - 1]) + flat[column - 1],
+                )
+            self.assertEqual(
+                int(offsets[index][-1]) + flat[-1], layout.num_embeddings[index]
+            )
+
+    def test_find_next_prime_never_reuses(self):
+        seen = set()
+        drawn = []
+        current = 96
+        for _ in range(5):
+            current = find_next_prime(current, seen)
+            seen.add(current)
+            drawn.append(current)
+        self.assertEqual(drawn, [97, 101, 103, 107, 109])
+        self.assertEqual(find_next_prime(96, {97, 101}), 103)
+
+    def test_multipliers_are_odd_layer_specific_and_overflow_safe(self):
+        multipliers = compute_engram_hash_multipliers((1, 14), 4, 99092)
+        self.assertEqual(multipliers.shape, (2, 4))
+        self.assertTrue(bool((multipliers % 2 == 1).all()))
+        self.assertFalse(np.array_equal(multipliers[0], multipliers[1]))
+        # The bound must keep compressed_id * multiplier inside int64: the
+        # running hash is an XOR of these products, so a wrap aliases n-grams.
+        self.assertLess(int(multipliers.max()) * 99091, int(np.iinfo(np.int64).max))
+        # Seeded per layer as 10007 * layer_id, so the draw is reproducible.
+        self.assertTrue(
+            np.array_equal(
+                multipliers[0],
+                compute_engram_hash_multipliers((1,), 4, 99092)[0],
+            )
+        )
+
+    def test_disabled_engram_yields_no_layout(self):
+        self.assertIsNone(
+            EngramLayout.from_config(
+                _engram_text_config(engram_layer_ids=[], engram_num_embeddings=[])
+            )
+        )
+        self.assertIsNone(
+            validate_engram_config(
+                _engram_text_config(engram_layer_ids=[], engram_num_embeddings=[])
+            )
+        )
+
+    def _assert_rejects(self, fragment, **overrides):
+        with self.assertRaises(ValueError) as ctx:
+            EngramLayout.from_config(_engram_text_config(**overrides))
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_a_bucket_span_wider_than_the_table_is_rejected(self):
+        # The reference would mask these ids to zero, indistinguishably from a
+        # legitimate remote-shard row, and silently degrade instead of failing.
+        self._assert_rejects("address past the end", engram_num_embeddings=[10, 10])
+
+    def test_malformed_engram_metadata_is_rejected(self):
+        self._assert_rejects("engram_max_ngram_size", engram_max_ngram_size=1)
+        self._assert_rejects("engram_n_heads", engram_n_heads=0)
+        self._assert_rejects("engram_head_dim", engram_head_dim=100)
+        self._assert_rejects("engram_vocab_size", engram_vocab_size=1)
+        self._assert_rejects("one table row count", engram_num_embeddings=[384006168])
+        self._assert_rejects(
+            "strictly increasing",
+            engram_layer_ids=[3, 1],
+            engram_num_embeddings=[10**9, 10**9],
+        )
+        self._assert_rejects(
+            "num_hidden_layers",
+            engram_layer_ids=[1, 99],
+            engram_num_embeddings=[10**9, 10**9],
+        )
+        self._assert_rejects("must be positive", engram_num_embeddings=[0, 0])
+
+    def test_validate_engram_config_checks_the_surrounding_fields(self):
+        self.assertIsNotNone(validate_engram_config(_official_text_config()))
+        with self.assertRaises(ValueError):
+            validate_engram_config(_engram_text_config(engram_compressed_vocab_size=0))
+        with self.assertRaises(ValueError):
+            validate_engram_config(_engram_text_config(engram_pad_token_id=10**6))
+        with self.assertRaises(ValueError):
+            validate_engram_config(_engram_text_config(hc_mult=0))
+
+
+class TestDeepseekV41EngramHashing(unittest.TestCase):
+    """EngramNgramHasher, exercised through the properties the reference guarantees.
+
+    The tiny config hashes 3-grams over 2 heads, so every position yields
+    (max_ngram_size - 1) * n_heads == 4 row ids per Engram layer -- the same
+    shape the official 4-gram/8-head config yields as 24.
+    """
+
+    def _hasher(self, max_seq_len=32, max_batch_size=2, **overrides):
+        config = _engram_text_config(**overrides)
+        layout = EngramLayout.from_config(config)
+        return layout, EngramNgramHasher(
+            layout,
+            _ENGRAM_TOKEN_MAP,
+            config.engram_pad_token_id,
+            config.engram_compressed_vocab_size,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+        )
+
+    def test_shape_is_one_row_id_per_ngram_size_per_head_per_layer(self):
+        layout, hasher = self._hasher()
+        ids = hasher.hash_ids(np.arange(12, dtype=np.int64).reshape(2, 6))
+        self.assertEqual(ids.shape, (2, 6, 2, 4))
+        self.assertEqual(ids.dtype, np.int64)
+        self.assertEqual(layout.n_hash_cols, 4)
+        self.assertIsInstance(hasher(np.arange(12).reshape(2, 6)), mx.array)
+
+    def test_every_id_lands_inside_its_own_bucket_range(self):
+        layout, hasher = self._hasher()
+        rng = np.random.default_rng(1)
+        ids = hasher.hash_ids(rng.integers(0, 40, size=(2, 10), dtype=np.int64))
+        offsets = layout.bucket_offsets()
+        for layer in range(2):
+            flat = layout.flat_primes(layer)
+            for column in range(layout.n_hash_cols):
+                low = int(offsets[layer][column])
+                column_ids = ids[:, :, layer, column]
+                self.assertGreaterEqual(int(column_ids.min()), low)
+                self.assertLess(int(column_ids.max()), low + flat[column])
+
+    def test_prefill_in_one_call_equals_token_by_token_decode(self):
+        """The shared history cache is what carries the n-gram across the split."""
+        _, whole = self._hasher()
+        _, split = self._hasher()
+        rng = np.random.default_rng(2)
+        tokens = rng.integers(0, 40, size=(2, 9), dtype=np.int64)
+        one_shot = whole.hash_ids(tokens, 0)
+        pieces = [split.hash_ids(tokens[:, :5], 0)]
+        for step in range(5, 9):
+            pieces.append(split.hash_ids(tokens[:, step : step + 1], step))
+        self.assertTrue(np.array_equal(one_shot, np.concatenate(pieces, axis=1)))
+
+    def test_the_same_ngram_hashes_the_same_wherever_it_occurs(self):
+        _, hasher = self._hasher()
+        tokens = np.array([[7, 8, 9, 1, 7, 8, 9]], dtype=np.int64)
+        ids = hasher.hash_ids(tokens)
+        # Positions 2 and 6 both end the 3-gram (7, 8, 9).
+        self.assertTrue(np.array_equal(ids[0, 2], ids[0, 6]))
+        self.assertFalse(np.array_equal(ids[0, 2], ids[0, 3]))
+
+    def test_tokens_that_normalize_alike_hash_alike(self):
+        """The compressed map is what makes this true, and it maps id -> id % 11."""
+        _, hasher = self._hasher()
+        ids = hasher.hash_ids(np.array([[3, 4, 5], [14, 15, 16]], dtype=np.int64))
+        self.assertTrue(np.array_equal(ids[0], ids[1]))
+
+    def test_an_ngram_never_spans_an_image_span(self):
+        """Look-back stops at a dead token, so the position after one hashes
+        exactly as if it started the sequence."""
+        tokens = np.array([[5, 6, 9, 5, 6]], dtype=np.int64)
+        mask = np.ones((1, 5), dtype=bool)
+        mask[0, 2] = False  # an image token occupies position 2
+        _, masked_hasher = self._hasher()
+        _, plain_hasher = self._hasher()
+        masked = masked_hasher.hash_ids(tokens, 0, mask)
+        plain = plain_hasher.hash_ids(tokens, 0)
+        # Position 3 can see no usable history across the image, exactly like
+        # position 0, and both carry token 5, so both hash the padded n-gram.
+        self.assertTrue(np.array_equal(masked[0, 3], masked[0, 0]))
+        # Without the mask that same position reaches back across position 2
+        # and hashes something else entirely, so the mask is load-bearing.
+        self.assertFalse(np.array_equal(plain[0, 3], plain[0, 0]))
+
+    def test_the_two_engram_layers_hash_independently(self):
+        _, hasher = self._hasher()
+        ids = hasher.hash_ids(np.array([[3, 4, 5, 6]], dtype=np.int64))
+        self.assertFalse(np.array_equal(ids[:, :, 0], ids[:, :, 1]))
+
+    def test_the_history_cache_is_eight_bytes_per_token_per_batch_row(self):
+        _, hasher = self._hasher(max_seq_len=64, max_batch_size=4)
+        self.assertEqual(hasher.nbytes(), 4 * 64 * 8)
+        # Shared once by both Engram layers, not duplicated per layer.
+        self.assertEqual(hasher.cache.shape, (4, 64))
+
+    def test_reset_makes_the_next_sequence_start_clean(self):
+        _, hasher = self._hasher()
+        hasher.hash_ids(np.array([[5, 6, 7]], dtype=np.int64), 0)
+        with_history = hasher.hash_ids(np.array([[8]], dtype=np.int64), 3)
+        hasher.reset()
+        after_reset = hasher.hash_ids(np.array([[8]], dtype=np.int64), 3)
+        self.assertFalse(np.array_equal(with_history, after_reset))
+        # A reset slot reads back as DEAD, so look-back is blocked rather than
+        # inventing a phantom compressed-token-0 n-gram: decoding at position
+        # 3 now hashes identically to the very start of a fresh sequence.
+        _, fresh = self._hasher()
+        self.assertTrue(
+            np.array_equal(
+                after_reset, fresh.hash_ids(np.array([[8]], dtype=np.int64), 0)
+            )
+        )
+
+    def test_out_of_bounds_and_malformed_requests_fail_closed(self):
+        _, hasher = self._hasher(max_seq_len=8, max_batch_size=2)
+        with self.assertRaises(ValueError):
+            hasher.hash_ids(np.zeros((3, 2), dtype=np.int64))
+        with self.assertRaises(ValueError):
+            hasher.hash_ids(np.zeros((1, 4), dtype=np.int64), 6)
+        with self.assertRaises(ValueError):
+            hasher.hash_ids(np.array([[99]], dtype=np.int64))
+        with self.assertRaises(ValueError):
+            hasher.hash_ids(np.array([[-1]], dtype=np.int64))
+        with self.assertRaises(ValueError):
+            hasher.hash_ids(np.zeros((4,), dtype=np.int64))
+        with self.assertRaises(ValueError):
+            hasher.hash_ids(np.zeros((1, 2), dtype=np.int64), 0, np.ones((1, 3), bool))
+
+    def test_a_token_map_wider_than_the_declared_compressed_vocab_is_rejected(self):
+        config = _engram_text_config()
+        layout = EngramLayout.from_config(config)
+        with self.assertRaises(ValueError) as ctx:
+            EngramNgramHasher(layout, [0, 1, 2, 99], 2, 11)
+        self.assertIn("compressed", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            EngramNgramHasher(layout, _ENGRAM_TOKEN_MAP, 999, 11)
+        with self.assertRaises(ValueError):
+            EngramNgramHasher(layout, _ENGRAM_TOKEN_MAP, 2, 11, max_seq_len=0)
+
+
+class TestDeepseekV41EngramRowStore(unittest.TestCase):
+    """SafetensorsEngramRowStore reads single rows out of a real file.
+
+    The fixtures here are tiny, but the access path is the one the 91.6 GiB
+    shard needs: parse the header, seek to a row byte range, read exactly that
+    row. Nothing in this class ever loads a whole tensor.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.weight, self.scale = _random_engram_shard(64, 32, 32, seed=7)
+        self.path = _write_engram_fixture(
+            os.path.join(self.tmp.name, "engram.safetensors"), self.weight, self.scale
+        )
+
+    def _store(self, **kwargs):
+        store = SafetensorsEngramRowStore(self.path, **kwargs)
+        self.addCleanup(store.close)
+        return store
+
+    def test_layout_is_taken_from_the_file_header(self):
+        store = self._store()
+        self.assertEqual((store.num_rows, store.dim), (64, 32))
+        self.assertEqual(store.block_size, 32)
+        self.assertEqual(store.scale_dim, 1)
+        # 32 packed value bytes plus one E8M0 scale code per row.
+        self.assertEqual(store.row_nbytes, 33)
+
+    def test_reads_exactly_the_requested_rows_in_the_requested_order(self):
+        store = self._store()
+        wanted = [5, 0, 63, 5]
+        weight, scale = store.read_rows(wanted)
+        self.assertEqual(weight.shape, (4, 32))
+        self.assertEqual(scale.shape, (4, 1))
+        self.assertTrue(np.array_equal(weight, self.weight[wanted]))
+        self.assertTrue(np.array_equal(scale, self.scale[wanted]))
+
+    def test_cost_is_counted_and_is_per_row_not_per_file(self):
+        store = self._store()
+        store.read_rows([1, 2, 3])
+        self.assertEqual(store.rows_read, 3)
+        self.assertEqual(store.bytes_read, 3 * store.row_nbytes)
+        store.read_rows([9])
+        self.assertEqual(store.rows_read, 4)
+        self.assertEqual(store.bytes_read, 4 * 33)
+        # The file itself is far larger than what was read.
+        self.assertGreater(os.path.getsize(self.path), store.bytes_read)
+
+    def test_an_empty_request_touches_the_file_at_all(self):
+        store = self._store()
+        weight, scale = store.read_rows([])
+        self.assertEqual(weight.shape, (0, 32))
+        self.assertEqual(scale.shape, (0, 1))
+        self.assertEqual(store.bytes_read, 0)
+
+    def test_a_row_id_past_the_shard_is_refused(self):
+        store = self._store()
+        with self.assertRaises(IndexError):
+            store.read_rows([64])
+        with self.assertRaises(IndexError):
+            store.read_rows([-1])
+
+    def test_the_store_closes_and_reopens_its_handle(self):
+        with SafetensorsEngramRowStore(self.path) as store:
+            first = store.read_rows([4])[0]
+            store.close()
+            self.assertTrue(np.array_equal(store.read_rows([4])[0], first))
+
+    def _reject(self, name, fragment, **fixture_kwargs):
+        path = _write_engram_fixture(
+            os.path.join(self.tmp.name, name), self.weight, self.scale, **fixture_kwargs
+        )
+        with self.assertRaises(ValueError) as ctx:
+            SafetensorsEngramRowStore(path)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_a_wider_than_one_byte_dtype_is_refused(self):
+        # BF16 rows would make every byte offset wrong by a factor of two, and
+        # the reads would silently return neighbouring rows.
+        self._reject("bf16.safetensors", "dtype", weight_dtype="BF16")
+        self._reject("f32scale.safetensors", "dtype", scale_dtype="F32")
+
+    def test_a_scale_grid_that_does_not_match_the_rows_is_refused(self):
+        def widen(header):
+            header["scale"]["shape"] = [32, 2]
+
+        self._reject("scale.safetensors", "requires", mutate=widen)
+
+    def test_byte_ranges_that_do_not_match_the_shape_are_refused(self):
+        def shrink(header):
+            header["weight"]["data_offsets"] = [0, 16]
+
+        self._reject("offsets.safetensors", "bytes", mutate=shrink)
+
+        def overrun(header):
+            size = header["scale"]["data_offsets"][1]
+            header["scale"]["shape"] = [64, 1]
+            header["scale"]["data_offsets"] = [size, size + 64]
+
+        self._reject("overrun.safetensors", "bytes long", mutate=overrun)
+
+    def test_a_missing_tensor_is_refused(self):
+        def drop(header):
+            header["quant_scale"] = header.pop("scale")
+
+        self._reject("missing.safetensors", "no tensor named", mutate=drop)
+
+    def test_a_non_default_tensor_naming_can_be_selected(self):
+        def rename(header):
+            header["engram.weight"] = header.pop("weight")
+            header["engram.scale"] = header.pop("scale")
+
+        path = _write_engram_fixture(
+            os.path.join(self.tmp.name, "named.safetensors"),
+            self.weight,
+            self.scale,
+            mutate=rename,
+        )
+        store = SafetensorsEngramRowStore(
+            path, weight_key="engram.weight", scale_key="engram.scale"
+        )
+        self.addCleanup(store.close)
+        self.assertTrue(np.array_equal(store.read_rows([2])[0][0], self.weight[2]))
+
+    def test_a_truncated_file_is_refused_rather_than_read_short(self):
+        path = os.path.join(self.tmp.name, "short.safetensors")
+        with open(self.path, "rb") as src:
+            blob = src.read()
+        with open(path, "wb") as dst:
+            dst.write(blob[: len(blob) - 40])
+        with self.assertRaises(ValueError):
+            SafetensorsEngramRowStore(path)
+
+    def test_a_file_that_is_not_safetensors_at_all_is_refused(self):
+        path = os.path.join(self.tmp.name, "junk.bin")
+        with open(path, "wb") as handle:
+            handle.write(b"not a safetensors file")
+        with self.assertRaises(ValueError):
+            SafetensorsEngramRowStore(path)
+
+
+class TestDeepseekV41EngramRowCache(unittest.TestCase):
+    """BoundedEngramRowCache: dedup on the way in, a hard ceiling on residency."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.weight, self.scale = _random_engram_shard(64, 32, 32, seed=11)
+        self.path = _write_engram_fixture(
+            os.path.join(self.tmp.name, "engram.safetensors"), self.weight, self.scale
+        )
+
+    def _cache(self, max_rows=8):
+        store = SafetensorsEngramRowStore(self.path)
+        self.addCleanup(store.close)
+        return store, BoundedEngramRowCache(store, max_rows=max_rows)
+
+    def test_a_cold_gather_reads_each_distinct_row_once(self):
+        store, cache = self._cache()
+        # A realistic hash gather repeats heavily: blocked look-backs all
+        # collapse onto the same padded n-gram row.
+        requested = [3, 3, 7, 3, 7, 1]
+        unique_ids, weight, scale, inverse = cache.gather_packed(requested)
+        self.assertEqual(list(unique_ids), [3, 7, 1])
+        self.assertEqual(weight.shape, (3, 32))
+        self.assertEqual(scale.shape, (3, 1))
+        self.assertEqual(list(inverse), [0, 0, 1, 0, 1, 2])
+        self.assertEqual(store.rows_read, 3)
+        self.assertEqual(cache.stats.requested_rows, 6)
+        self.assertEqual(cache.stats.unique_rows, 3)
+        self.assertEqual(cache.stats.misses, 3)
+        self.assertEqual(cache.stats.hits, 0)
+
+    def test_a_warm_gather_reads_nothing_at_all(self):
+        store, cache = self._cache()
+        cache.gather_packed([3, 7, 1])
+        bytes_after_cold = store.bytes_read
+        cache.gather_packed([1, 7, 3, 3])
+        self.assertEqual(store.bytes_read, bytes_after_cold)
+        self.assertEqual(cache.stats.hits, 3)
+        self.assertEqual(cache.stats.rows_fetched, 3)
+
+    def test_rows_come_back_in_request_order(self):
+        store, cache = self._cache()
+        requested = [9, 2, 9, 40, 2]
+        _, weight, _, inverse = cache.gather_packed(requested)
+        restored = weight[inverse]
+        self.assertTrue(np.array_equal(restored, self.weight[requested]))
+        rows = cache.gather_rows(requested)
+        self.assertEqual(rows.shape, (5, 32))
+        expected = dequantize_engram_rows(self.weight[requested], self.scale[requested])
+        self.assertTrue(
+            np.array_equal(
+                np.asarray(rows.astype(mx.float32)),
+                np.asarray(expected.astype(mx.float32)),
+            )
+        )
+
+    def test_residency_is_packed_bytes_of_the_rows_held(self):
+        store, cache = self._cache(max_rows=8)
+        self.assertEqual(cache.nbytes(), 0)
+        cache.gather_packed([1, 2, 3])
+        self.assertEqual(cache.resident_rows, 3)
+        self.assertEqual(cache.nbytes(), 3 * store.row_nbytes)
+        cache.clear()
+        self.assertEqual(cache.resident_rows, 0)
+        self.assertEqual(cache.nbytes(), 0)
+
+    def test_the_bound_is_never_exceeded_and_evictions_are_counted(self):
+        store, cache = self._cache(max_rows=4)
+        for row_id in range(12):
+            cache.gather_packed([row_id])
+        self.assertEqual(cache.resident_rows, 4)
+        self.assertEqual(cache.nbytes(), 4 * store.row_nbytes)
+        self.assertEqual(cache.stats.evictions, 8)
+        self.assertEqual(store.rows_read, 12)
+
+    def test_eviction_is_least_recently_used(self):
+        store, cache = self._cache(max_rows=2)
+        cache.gather_packed([1])
+        cache.gather_packed([2])
+        cache.gather_packed([1])  # refreshes 1, so 2 is now the oldest
+        cache.gather_packed([3])
+        reads_before = store.rows_read
+        cache.gather_packed([1])
+        self.assertEqual(store.rows_read, reads_before)  # 1 was retained
+        cache.gather_packed([2])
+        self.assertEqual(store.rows_read, reads_before + 1)  # 2 was evicted
+
+    def test_an_evicted_row_is_refetched_with_identical_bytes(self):
+        store, cache = self._cache(max_rows=1)
+        first = cache.gather_packed([5])[1].copy()
+        cache.gather_packed([6])
+        again = cache.gather_packed([5])[1]
+        self.assertTrue(np.array_equal(first, again))
+        self.assertTrue(np.array_equal(again[0], self.weight[5]))
+
+    def test_a_gather_larger_than_the_bound_is_served_then_trimmed(self):
+        store, cache = self._cache(max_rows=4)
+        requested = list(range(16))
+        _, weight, _, inverse = cache.gather_packed(requested)
+        # Correctness first: every requested row really came back.
+        self.assertTrue(np.array_equal(weight[inverse], self.weight[requested]))
+        # Then the ceiling reasserts itself, so a long prompt cannot grow the
+        # cache without bound.
+        self.assertEqual(cache.resident_rows, 4)
+        self.assertEqual(cache.nbytes(), 4 * store.row_nbytes)
+
+    def test_an_empty_gather_is_a_no_op(self):
+        store, cache = self._cache()
+        unique_ids, weight, scale, inverse = cache.gather_packed([])
+        self.assertEqual(weight.shape, (0, 32))
+        self.assertEqual(scale.shape, (0, 1))
+        self.assertEqual(unique_ids.size, 0)
+        self.assertEqual(inverse.size, 0)
+        self.assertEqual(store.bytes_read, 0)
+        self.assertEqual(cache.gather_rows([]).shape, (0, 32))
+
+    def test_a_cache_that_cannot_hold_a_row_is_refused(self):
+        store, _ = self._cache()
+        with self.assertRaises(ValueError):
+            BoundedEngramRowCache(store, max_rows=0)
+
+
+def _decode_e4m3fn(codes):
+    """An independent, spec-literal E4M3FN decode used to check the port.
+
+    Written out here rather than reusing the production helper so the test has
+    its own source of truth: sign / 4-bit exponent / 3-bit mantissa, bias 7,
+    with the exponent-zero case decoded as a subnormal.
+    """
+    codes = np.asarray(codes, dtype=np.uint8).astype(np.int64)
+    sign = np.where(codes >> 7 == 1, -1.0, 1.0)
+    exponent = (codes >> 3) & 0xF
+    mantissa = (codes & 0x7).astype(np.float64)
+    normal = (1.0 + mantissa / 8.0) * np.power(2.0, exponent.astype(np.float64) - 7.0)
+    subnormal = mantissa * (2.0**-9)
+    return sign * np.where(exponent == 0, subnormal, normal)
+
+
+def _reference_engram_gate(stream, key, weight, eps, clamp=1e-6):
+    """An independent float64 transcription of the official gate expression."""
+    h = np.asarray(stream, dtype=np.float64)
+    k = np.asarray(key, dtype=np.float64)
+    w = np.asarray(weight, dtype=np.float64)
+    dim = h.shape[-1]
+    h_rstd = 1.0 / np.sqrt(np.mean(h * h, axis=-1) + eps)
+    k_rstd = 1.0 / np.sqrt(np.mean(k * k, axis=-1) + eps)
+    dot = np.sum(h * w * k, axis=-1) * h_rstd * k_rstd / np.sqrt(dim)
+    signed = np.copysign(np.sqrt(np.maximum(np.abs(dot), clamp)), dot)
+    return 1.0 / (1.0 + np.exp(-signed))
+
+
+class TestDeepseekV41EngramDequant(unittest.TestCase):
+    """Row-level FP8 x E8M0 dequantization of gathered rows only."""
+
+    def test_rows_decode_to_value_times_two_to_the_scale(self):
+        weight, scale = _random_engram_shard(6, 64, ENGRAM_FP8_BLOCK_SIZE, seed=3)
+        rows = dequantize_engram_rows(weight, scale, ENGRAM_FP8_BLOCK_SIZE, mx.float32)
+        self.assertEqual(rows.shape, (6, 64))
+        expected = _decode_e4m3fn(weight).reshape(6, 2, ENGRAM_FP8_BLOCK_SIZE)
+        expected = expected * np.power(2.0, scale.astype(np.float64) - 127.0)[..., None]
+        self.assertTrue(
+            np.allclose(np.asarray(rows), expected.reshape(6, 64), rtol=1e-6, atol=0.0)
+        )
+
+    def test_each_scale_code_governs_exactly_its_own_block(self):
+        """A 2-D block tiling would smear these scales across the wrong columns."""
+        weight = np.full((1, 64), 0x38, dtype=np.uint8)  # E4M3 1.0
+        scale = np.array([[127, 130]], dtype=np.uint8)  # 2**0 then 2**3
+        rows = np.asarray(
+            dequantize_engram_rows(weight, scale, ENGRAM_FP8_BLOCK_SIZE, mx.float32)
+        )
+        self.assertTrue(np.all(rows[0, :32] == 1.0))
+        self.assertTrue(np.all(rows[0, 32:] == 8.0))
+
+    def test_an_empty_gather_decodes_to_an_empty_block(self):
+        rows = dequantize_engram_rows(
+            np.zeros((0, 32), np.uint8), np.zeros((0, 1), np.uint8)
+        )
+        self.assertEqual(rows.shape, (0, 32))
+
+    def test_mismatched_row_blocks_are_refused(self):
+        weight, scale = _random_engram_shard(4, 32, 32, seed=4)
+        with self.assertRaises(ValueError):
+            dequantize_engram_rows(weight, scale[:2])
+        with self.assertRaises(ValueError):
+            dequantize_engram_rows(weight, np.zeros((4, 2), np.uint8))
+        with self.assertRaises(ValueError):
+            dequantize_engram_rows(weight[0], scale[0])
+        with self.assertRaises(ValueError):
+            dequantize_engram_rows(np.zeros((4, 20), np.uint8), scale)
+
+
+class TestDeepseekV41EngramGate(unittest.TestCase):
+    """The signed-sqrt-sigmoid gate that decides how much Engram is injected."""
+
+    def _inputs(self, seed=5, batch=2, seqlen=3, hc_mult=2, dim=16, scale=1.0):
+        rng = np.random.default_rng(seed)
+        stream = rng.normal(size=(batch, seqlen, hc_mult, dim)).astype(np.float32)
+        key = rng.normal(size=(batch, seqlen, hc_mult, dim)).astype(np.float32)
+        weight = rng.normal(size=(hc_mult, dim)).astype(np.float32)
+        return stream * scale, key, weight
+
+    def test_matches_an_independent_float64_transcription(self):
+        stream, key, weight = self._inputs()
+        gate = engram_signed_sqrt_sigmoid_gate(
+            mx.array(stream), mx.array(key), mx.array(weight), 1e-6
+        )
+        self.assertEqual(gate.shape, (2, 3, 2))
+        expected = _reference_engram_gate(stream, key, weight, 1e-6)
+        self.assertTrue(np.allclose(np.asarray(gate), expected, atol=1e-6))
+
+    def test_the_gate_is_a_probability_in_the_open_unit_interval(self):
+        stream, key, weight = self._inputs(seed=6, scale=50.0)
+        gate = np.asarray(
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream), mx.array(key), mx.array(weight), 1e-6
+            )
+        )
+        self.assertTrue(np.all(gate > 0.0))
+        self.assertTrue(np.all(gate < 1.0))
+
+    def test_normalization_is_per_hc_copy_so_a_rescaled_stream_barely_moves(self):
+        """RMS normalizing each (token, hc copy) row makes the gate scale free,
+        up to the eps floor: a 100x louder residual must not saturate it."""
+        stream, key, weight = self._inputs(seed=7)
+        base = np.asarray(
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream), mx.array(key), mx.array(weight), 1e-6
+            )
+        )
+        loud = np.asarray(
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream * 100.0), mx.array(key), mx.array(weight), 1e-6
+            )
+        )
+        self.assertTrue(np.allclose(base, loud, atol=1e-4))
+
+    def test_a_silent_stream_lands_on_the_clamp_plateau(self):
+        """Without the clamp the sqrt derivative is infinite at zero, so an
+        all-zero stream is exactly the case the floor exists for."""
+        stream = np.zeros((1, 1, 2, 16), dtype=np.float32)
+        _, key, weight = self._inputs(seed=8)
+        gate = np.asarray(
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream), mx.array(key[:1, :1]), mx.array(weight), 1e-6
+            )
+        )
+        plateau = 1.0 / (1.0 + np.exp(-np.sqrt(ENGRAM_GATE_CLAMP)))
+        self.assertTrue(np.allclose(gate, plateau, atol=1e-6))
+
+    def test_the_sign_of_the_match_moves_the_gate_across_one_half(self):
+        stream, key, weight = self._inputs(seed=9)
+        positive = np.asarray(
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream), mx.array(stream), mx.array(np.abs(weight)), 1e-6
+            )
+        )
+        negative = np.asarray(
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream), mx.array(-stream), mx.array(np.abs(weight)), 1e-6
+            )
+        )
+        self.assertTrue(np.all(positive > 0.5))
+        self.assertTrue(np.all(negative < 0.5))
+
+    def test_shape_and_clamp_violations_are_refused(self):
+        stream, key, weight = self._inputs()
+        with self.assertRaises(ValueError):
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream), mx.array(key[:1]), mx.array(weight), 1e-6
+            )
+        with self.assertRaises(ValueError):
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream), mx.array(key), mx.array(weight[:1]), 1e-6
+            )
+        with self.assertRaises(ValueError):
+            engram_signed_sqrt_sigmoid_gate(
+                mx.array(stream), mx.array(key), mx.array(weight), 1e-6, clamp_value=0.0
+            )
+
+
+class TestDeepseekV41EngramEmbedding(unittest.TestCase):
+    """The row-sharded table lookup, which never allocates a table."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.weight, self.scale = _random_engram_shard(64, 32, 32, seed=13)
+
+    def _embedding(self, lo, hi, num_embeddings=64, rank=0, world_size=1, **kwargs):
+        path = _write_engram_fixture(
+            os.path.join(self.tmp.name, "shard-%d-%d.safetensors" % (lo, hi)),
+            self.weight[lo:hi],
+            self.scale[lo:hi],
+        )
+        store = SafetensorsEngramRowStore(path)
+        self.addCleanup(store.close)
+        cache = BoundedEngramRowCache(store, max_rows=kwargs.pop("max_rows", 16))
+        return DeepseekV41EngramEmbedding(
+            num_embeddings, 32, cache, rank=rank, world_size=world_size, **kwargs
+        )
+
+    def test_the_module_holds_no_dense_table_and_no_parameters_at_all(self):
+        embedding = self._embedding(0, 64)
+        self.assertEqual(dict(tree_flatten(embedding.parameters())), {})
+        self.assertEqual(embedding.num_embeddings, 64)
+        # Whatever the table says, resident bytes are the cache bound only.
+        self.assertEqual(embedding.nbytes(), 0)
+
+    def test_lookup_returns_the_dequantized_rows_for_the_requested_ids(self):
+        embedding = self._embedding(0, 64)
+        ids = np.array([[3, 17, 3], [63, 0, 17]], dtype=np.int64)
+        rows = embedding(ids, dtype=mx.float32)
+        self.assertEqual(rows.shape, (2, 3, 32))
+        flat = ids.reshape(-1)
+        expected = dequantize_engram_rows(
+            self.weight[flat], self.scale[flat], 32, mx.float32
+        )
+        self.assertTrue(
+            np.array_equal(np.asarray(rows).reshape(6, 32), np.asarray(expected))
+        )
+
+    def test_resident_bytes_track_the_cache_bound_not_the_table(self):
+        embedding = self._embedding(0, 64, max_rows=4)
+        embedding(np.arange(64, dtype=np.int64))
+        self.assertEqual(embedding.nbytes(), 4 * 33)
+        self.assertLess(embedding.nbytes(), embedding.num_embeddings * 33)
+
+    def test_an_empty_lookup_is_well_shaped(self):
+        embedding = self._embedding(0, 64)
+        self.assertEqual(embedding(np.zeros((2, 0), np.int64)).shape, (2, 0, 32))
+
+    def test_an_id_outside_the_table_is_refused_rather_than_zeroed(self):
+        """The reference masks such an id to zero, which is indistinguishable
+        from a legitimate remote-shard row and hides a malformed layout."""
+        embedding = self._embedding(0, 64)
+        with self.assertRaises(IndexError):
+            embedding(np.array([64], dtype=np.int64))
+        with self.assertRaises(IndexError):
+            embedding(np.array([-1], dtype=np.int64))
+
+    def test_a_store_that_does_not_hold_this_rank_shard_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._embedding(0, 32, num_embeddings=128, rank=0, world_size=2)
+        self.assertIn("rows", str(ctx.exception))
+
+    def test_geometry_violations_are_refused(self):
+        for kwargs in (
+            {"world_size": 0},
+            {"rank": 2, "world_size": 2},
+        ):
+            with self.assertRaises(ValueError):
+                self._embedding(0, 64, **kwargs)
+
+    def test_a_sharded_lookup_without_a_reducer_fails_loud(self):
+        embedding = self._embedding(0, 32, rank=0, world_size=2)
+        with self.assertRaises(RuntimeError) as ctx:
+            embedding(np.array([[1, 40]], dtype=np.int64))
+        message = str(ctx.exception)
+        self.assertIn("all_reduce", message)
+        self.assertIn("world_size", message)
+
+    def test_a_reducer_that_returns_nothing_fails_loud(self):
+        embedding = self._embedding(
+            0, 32, rank=0, world_size=2, all_reduce=lambda rows: None
+        )
+        with self.assertRaises(RuntimeError):
+            embedding(np.array([[1]], dtype=np.int64))
+
+    def test_each_rank_zeroes_the_rows_it_does_not_own(self):
+        identity = lambda rows: rows
+        rank0 = self._embedding(0, 32, rank=0, world_size=2, all_reduce=identity)
+        rank1 = self._embedding(32, 64, rank=1, world_size=2, all_reduce=identity)
+        ids = np.array([[5, 40]], dtype=np.int64)
+        left = np.asarray(rank0(ids, dtype=mx.float32))
+        right = np.asarray(rank1(ids, dtype=mx.float32))
+        self.assertTrue(np.all(left[0, 1] == 0.0))  # row 40 belongs to rank 1
+        self.assertTrue(np.all(right[0, 0] == 0.0))  # row 5 belongs to rank 0
+
+    def test_summing_the_shards_reproduces_the_unsharded_lookup(self):
+        """This is what the injected all-reduce is for: each rank contributes
+        only its own rows, and the sum is the whole lookup."""
+        identity = lambda rows: rows
+        whole = self._embedding(0, 64)
+        rank0 = self._embedding(0, 32, rank=0, world_size=2, all_reduce=identity)
+        rank1 = self._embedding(32, 64, rank=1, world_size=2, all_reduce=identity)
+        ids = np.array([[5, 40, 63, 0]], dtype=np.int64)
+        summed = np.asarray(rank0(ids, dtype=mx.float32)) + np.asarray(
+            rank1(ids, dtype=mx.float32)
+        )
+        self.assertTrue(
+            np.array_equal(summed, np.asarray(whole(ids, dtype=mx.float32)))
+        )
+
+    def test_the_injected_reducer_is_the_only_cross_rank_coupling(self):
+        calls = []
+
+        def reducer(rows):
+            calls.append(rows.shape)
+            return rows
+
+        embedding = self._embedding(0, 32, rank=0, world_size=2, all_reduce=reducer)
+        embedding(np.array([[1, 2, 3]], dtype=np.int64))
+        self.assertEqual(calls, [(1, 3, 32)])
+
+    def test_world_size_one_needs_no_reducer(self):
+        embedding = self._embedding(0, 64)
+        self.assertIsNone(embedding.all_reduce)
+        self.assertEqual(embedding(np.array([1], dtype=np.int64)).shape, (1, 32))
+
+
+class TestDeepseekV41EngramModule(unittest.TestCase):
+    """DeepseekV41Engram writing a gated n-gram lookup into the residual stream."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = _engram_text_config()
+        self.layout = EngramLayout.from_config(self.config)
+
+    def _engram(self, layer_id=1, seed=17):
+        index = self.layout.layer_ids.index(layer_id)
+        rows = self.layout.num_embeddings[index]
+        weight, scale = _random_engram_shard(
+            rows, self.layout.head_dim, ENGRAM_FP8_BLOCK_SIZE, seed=seed
+        )
+        path = _write_engram_fixture(
+            os.path.join(self.tmp.name, "layer%d.safetensors" % layer_id),
+            weight,
+            scale,
+        )
+        store = SafetensorsEngramRowStore(path)
+        self.addCleanup(store.close)
+        embedding = DeepseekV41EngramEmbedding(
+            rows, self.layout.head_dim, BoundedEngramRowCache(store, max_rows=64)
+        )
+        module = DeepseekV41Engram(self.config, layer_id, self.layout, embedding)
+        rng = np.random.default_rng(seed)
+        module.wkv.weight = mx.array(
+            rng.normal(scale=0.1, size=module.wkv.weight.shape).astype(np.float32)
+        )
+        return module
+
+    def _stream_and_ids(self, batch=2, seqlen=4, seed=19, layer_id=1):
+        rng = np.random.default_rng(seed)
+        stream = mx.array(
+            rng.normal(
+                size=(batch, seqlen, self.config.hc_mult, self.config.hidden_size)
+            ).astype(np.float32)
+        )
+        hasher = EngramNgramHasher(
+            self.layout,
+            _ENGRAM_TOKEN_MAP,
+            self.config.engram_pad_token_id,
+            self.config.engram_compressed_vocab_size,
+            max_batch_size=batch,
+            max_seq_len=seqlen,
+        )
+        tokens = rng.integers(0, 40, size=(batch, seqlen), dtype=np.int64)
+        index = self.layout.layer_ids.index(layer_id)
+        return stream, hasher.hash_ids(tokens)[:, :, index, :]
+
+    def test_the_stream_shape_survives_the_injection(self):
+        module = self._engram()
+        stream, hash_ids = self._stream_and_ids()
+        out = module(stream, hash_ids)
+        self.assertEqual(out.shape, stream.shape)
+        self.assertEqual(out.dtype, stream.dtype)
+
+    def test_the_lookup_actually_changes_the_stream(self):
+        module = self._engram()
+        stream, hash_ids = self._stream_and_ids()
+        out = np.asarray(module(stream, hash_ids))
+        self.assertFalse(np.allclose(out, np.asarray(stream)))
+
+    def test_the_hash_ids_are_what_select_the_injection(self):
+        module = self._engram()
+        stream, hash_ids = self._stream_and_ids()
+        other = np.asarray(hash_ids)[:, ::-1, :]
+        self.assertFalse(
+            np.allclose(
+                np.asarray(module(stream, hash_ids)), np.asarray(module(stream, other))
+            )
+        )
+
+    def test_a_masked_position_passes_through_untouched(self):
+        """An image span has no n-gram history worth injecting, so the gate is
+        shut there and the residual stream must come out bit-identical."""
+        module = self._engram()
+        stream, hash_ids = self._stream_and_ids()
+        mask = np.ones(tuple(stream.shape[:2]), dtype=bool)
+        mask[0, 2] = False
+        out = np.asarray(module(stream, hash_ids, mask))
+        reference = np.asarray(stream)
+        self.assertTrue(np.array_equal(out[0, 2], reference[0, 2]))
+        self.assertFalse(np.allclose(out[0, 1], reference[0, 1]))
+
+    def test_the_two_engram_layers_inject_different_things(self):
+        first = self._engram(layer_id=1, seed=17)
+        second = self._engram(layer_id=3, seed=23)
+        stream, first_ids = self._stream_and_ids(layer_id=1)
+        _, second_ids = self._stream_and_ids(layer_id=3)
+        self.assertFalse(np.array_equal(first_ids, second_ids))
+        self.assertFalse(
+            np.allclose(
+                np.asarray(first(stream, first_ids)),
+                np.asarray(second(stream, second_ids)),
+            )
+        )
+
+    def test_a_non_engram_layer_is_refused(self):
+        module_embedding = self._engram().embed
+        with self.assertRaises(ValueError):
+            DeepseekV41Engram(self.config, 2, self.layout, module_embedding)
+
+    def test_an_embedding_for_the_wrong_table_is_refused(self):
+        wrong = self._engram(layer_id=3, seed=23).embed
+        with self.assertRaises(ValueError) as ctx:
+            DeepseekV41Engram(self.config, 1, self.layout, wrong)
+        self.assertIn("row table", str(ctx.exception))
+
+    def test_malformed_stream_or_hash_shapes_are_refused(self):
+        module = self._engram()
+        stream, hash_ids = self._stream_and_ids()
+        with self.assertRaises(ValueError):
+            module(stream[:, :, 0], hash_ids)
+        with self.assertRaises(ValueError):
+            module(stream, np.asarray(hash_ids)[:1])
+        with self.assertRaises(ValueError):
+            module(stream, np.asarray(hash_ids)[..., :2])
+        with self.assertRaises(ValueError):
+            module(stream, hash_ids, np.ones((1, 1), dtype=bool))
+
+
+class TestDeepseekV41EngramMemoryBounds(unittest.TestCase):
+    """The load-bearing claim of this whole path: cost does not scale with the table.
+
+    The official Engram tensors are ~91.6 GiB and ~98.3 GiB. Nothing here may
+    grow with that. Rather than watch peak RSS, which is noisy, this measures
+    the two deterministic counters that would have to move if a table were
+    being materialized: bytes pulled off disk, and packed bytes held resident.
+    """
+
+    def test_gather_cost_is_invariant_to_how_large_the_table_is(self):
+        rng = np.random.default_rng(29)
+        # Heavy repetition, exactly as a real B x L x 24 hash gather produces.
+        requested = rng.integers(0, 512, size=1024, dtype=np.int64)
+        unique = int(np.unique(requested).size)
+        bound = 128
+        observed = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for n_rows in (1024, 4096, 16384):
+                weight, scale = _random_engram_shard(n_rows, 32, 32, seed=n_rows)
+                path = _write_engram_fixture(
+                    os.path.join(tmp, "t%d.safetensors" % n_rows), weight, scale
+                )
+                with SafetensorsEngramRowStore(path) as store:
+                    cache = BoundedEngramRowCache(store, max_rows=bound)
+                    cache.gather_packed(requested)
+                    observed.append(
+                        (os.path.getsize(path), store.bytes_read, cache.nbytes())
+                    )
+
+        file_sizes = [item[0] for item in observed]
+        bytes_read = {item[1] for item in observed}
+        resident = {item[2] for item in observed}
+        # The tables differ by 16x on disk ...
+        self.assertGreater(file_sizes[-1], 15 * file_sizes[0])
+        # ... and every measured cost is bit-identical across all three.
+        self.assertEqual(len(bytes_read), 1)
+        self.assertEqual(len(resident), 1)
+        self.assertEqual(bytes_read.pop(), unique * 33)
+        self.assertEqual(resident.pop(), min(unique, bound) * 33)
+
+    def test_the_hash_history_cache_is_eight_bytes_per_token(self):
+        config = _engram_text_config()
+        layout = EngramLayout.from_config(config)
+        hasher = EngramNgramHasher(
+            layout,
+            _ENGRAM_TOKEN_MAP,
+            config.engram_pad_token_id,
+            config.engram_compressed_vocab_size,
+            max_batch_size=4,
+            max_seq_len=4096,
+        )
+        # One shared int64 history per (batch row, position) for all Engram
+        # layers together -- it does not scale with n_hash_cols or table size.
+        self.assertEqual(hasher.nbytes(), 4 * 4096 * 8)
 
 if __name__ == "__main__":
     unittest.main()

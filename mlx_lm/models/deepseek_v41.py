@@ -52,9 +52,28 @@ architecture (Plan 0051 M2). It provides:
     cross-rank all-reduce that would combine those partial sums is not
     implemented, and executing at ``world_size > 1`` fails loud.
 
+  * The exact sparse Engram n-gram path, which is the one component that
+    cannot be ported by allocating its weights: the two official tables are
+    384,006,168 x 256 and 384,016,682 x 256 packed FP8 rows, ~101 GB of
+    payload. ``normalize_engram_token_text`` /
+    ``build_engram_compressed_token_map`` reproduce the official
+    NFKC/NFD/StripAccents/Lowercase/whitespace-fold normalizer chain that
+    defines the compressed vocabulary every hash multiplier is derived from;
+    ``EngramLayout`` builds the disjoint prime-sized bucket ranges, which
+    tile the two official tables exactly; ``EngramNgramHasher`` produces the
+    ``(max_ngram_size - 1) * n_heads == 24`` row ids per token per Engram
+    layer over a shared, dead-token-aware history cache;
+    ``SafetensorsEngramRowStore`` reads individual rows by byte range and
+    ``BoundedEngramRowCache`` dedups and bounds them;
+    ``dequantize_engram_rows`` applies the row-level FP8/E8M0 decode;
+    ``DeepseekV41EngramEmbedding`` shards rows across ranks behind an
+    explicitly injected all-reduce (absent one, ``world_size > 1`` fails
+    loud); and ``DeepseekV41Engram`` applies the signed-sqrt-sigmoid gate.
+    No surface in this module accepts or returns a dense table.
+
 Explicitly out of scope for this slice (tracked as later M2/M3 work, not
 faked here): the Block/Transformer glue that would wire the attention stack,
-the Hyper-Connections and the MoE into one backbone, sparse Engram gather,
+the Hyper-Connections, the MoE and the Engram path into one backbone,
 vision/aligner token-budget arithmetic, and DSpark/MTP. ``Model``
 is registered (``model_type == "deepseek_v41"``, not a ``deepseek_v4`` alias)
 so config validation and packed-weight loading are exercisable now, but
@@ -63,12 +82,27 @@ rather than silently producing an unfaithful forward pass: the attention
 stack above is real, and the glue around it is honestly absent.
 """
 
+import json
 import math
+import re
+import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .base import BaseModelArgs
 from .cache import _BaseCache
@@ -2719,6 +2753,1290 @@ class DeepseekV41MoE(nn.Module):
         return y.astype(x.dtype).reshape(shape)
 
 
+# --------------------------------------------------------------------------- #
+# Engram: sparse n-gram hash addressing                                        #
+#                                                                              #
+# Faithful to inference/engram.py (build_compressed_token_map,                 #
+# find_next_prime, compute_hash_multipliers, EngramLayout, NgramHashState) and #
+# inference/model.py (ParallelEngramEmbedding, Engram) at the pinned revision  #
+# deepseek-ai/DeepSeek-V4.1-Flash@dba1be0a40aa45a94ad051997016db3960a90277.    #
+#                                                                              #
+# The load-bearing property of this whole section is that NOTHING here ever    #
+# materializes an Engram table. The two official tables are 384,006,168 x 256  #
+# and 384,016,682 x 256 float8_e4m3fn rows plus their E8M0 block scales --     #
+# ~91.6 and ~98.3 GiB respectively, ~101 GB of raw safetensors payload across  #
+# the shards that hold them. Rows are therefore addressed individually against #
+# a file-backed row store (EngramRowStore) through a bounded LRU              #
+# (BoundedEngramRowCache), and no surface in this module exposes, returns or   #
+# accepts a dense [num_embeddings, head_dim] tensor. Peak memory of a lookup   #
+# is a function of the number of *unique* rows requested plus the cache bound, #
+# never of the table size.                                                     #
+# --------------------------------------------------------------------------- #
+
+# ParallelEngramEmbedding uses the global fp8_block_size, which the pinned
+# config.json fixes at 32 (quantization_config.weight_block_size == [32, 32]).
+# Unlike a 2-D-tiled Linear weight, an Engram scale row is 1-D: one E8M0 code
+# per 32 contiguous columns of that row, i.e. head_dim // 32 == 8 codes/row.
+ENGRAM_FP8_BLOCK_SIZE = 32
+
+# Engram.clamp_value: the floor applied to |dot| before the signed sqrt, so the
+# sqrt never sees exactly zero (its derivative is unbounded there).
+ENGRAM_GATE_CLAMP = 1e-6
+
+# compute_hash_multipliers seeds one numpy PCG64 stream per Engram layer as
+# np.random.default_rng(10007 * layer_id), so two layers never hash alike.
+ENGRAM_RNG_LAYER_SEED_STRIDE = 10007
+
+# NgramHashState.DEAD: the compressed-id sentinel written into the history
+# cache for a token that may not take part in an n-gram (an image span).
+# Look-back stops at a DEAD token, so an n-gram never spans one.
+ENGRAM_DEAD_TOKEN = -1
+
+# build_compressed_token_map normalizer chain, in the exact order the official
+# tokenizers.normalizers.Sequence applies it. Kept as data so the contract is
+# inspectable and testable, not just implied by the code below.
+ENGRAM_NORMALIZER_SEQUENCE = (
+    "NFKC",
+    "NFD",
+    "StripAccents",
+    "Lowercase",
+    "Replace(Regex(r'[ \\t\\r\\n]+'), ' ')",
+    "Replace(Regex(r'^ $'), sentinel)",
+    "Strip",
+    "Replace(sentinel, ' ')",
+)
+
+# A Unicode private-use character. A token that is exactly one space is swapped
+# to this before Strip() so it survives instead of collapsing to the empty
+# string and merging with unrelated tokens; it is swapped back afterwards.
+ENGRAM_SPACE_SENTINEL = "\ue000"
+
+# The Unicode replacement character. A token whose decoded form contains it is
+# a partial UTF-8 byte token: there is nothing to normalize, so it is keyed by
+# its raw (id_to_token) form instead.
+_UNICODE_REPLACEMENT_CHAR = "\ufffd"
+
+_ENGRAM_WHITESPACE_RUN = re.compile(r"[ \t\r\n]+")
+
+# The Unicode White_Space property, which is what the official Strip()
+# normalizer trims (Rust char::is_whitespace). Spelled out rather than using
+# str.strip(), whose set is str.isspace() and additionally includes the C0
+# separators U+001C..U+001F -- trimming those would silently diverge.
+_UNICODE_WHITESPACE = frozenset(
+    "\t\n\x0b\x0c\r \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def _strip_unicode_whitespace(text: str) -> str:
+    start, end = 0, len(text)
+    while start < end and text[start] in _UNICODE_WHITESPACE:
+        start += 1
+    while end > start and text[end - 1] in _UNICODE_WHITESPACE:
+        end -= 1
+    return text[start:end]
+
+
+def normalize_engram_token_text(text: str) -> str:
+    """Apply the exact official Engram normalizer chain to one token text.
+
+    This is the half of the compressed-vocabulary contract that model code
+    owns: given the text a tokenizer decoded for a single id, produce the key
+    that decides which ids collapse together. Every hash multiplier is derived
+    from the resulting compressed vocab size, so a divergence here does not
+    degrade quality gracefully -- it silently rehashes the entire table.
+
+    Faithful to ENGRAM_NORMALIZER_SEQUENCE: NFKC, then NFD, then drop every
+    non-spacing mark (StripAccents), then lowercase, then fold every run of
+    space/tab/CR/LF to a single space, then protect a lone space with
+    ENGRAM_SPACE_SENTINEL, then trim Unicode whitespace, then restore the
+    sentinel. So " The", "the" and "THE" all produce the same key.
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"expected a str token text, got {type(text).__name__}")
+    normalized = unicodedata.normalize("NFD", unicodedata.normalize("NFKC", text))
+    normalized = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
+    normalized = normalized.lower()
+    normalized = _ENGRAM_WHITESPACE_RUN.sub(" ", normalized)
+    # The official rule is Replace(Regex(r"^ $"), sentinel) under Rust regex
+    # semantics, where ^ and $ anchor the whole haystack and $ does not also
+    # match before a trailing newline -- i.e. exactly "the string is one space".
+    if normalized == " ":
+        normalized = ENGRAM_SPACE_SENTINEL
+    normalized = _strip_unicode_whitespace(normalized)
+    return normalized.replace(ENGRAM_SPACE_SENTINEL, " ")
+
+
+def engram_compressed_token_key(decoded_text: str, raw_token: Optional[str]) -> str:
+    """The compressed-vocabulary key for one token id.
+
+    A decoded text containing U+FFFD is a partial UTF-8 byte token and is keyed
+    by its raw form; otherwise the normalized text is used, falling back to the
+    unnormalized text when normalization empties it (so a whitespace-only token
+    keeps an identity of its own instead of merging into one bucket).
+    """
+    if _UNICODE_REPLACEMENT_CHAR in decoded_text:
+        if raw_token is None:
+            raise ValueError(
+                "a token whose decoded text contains U+FFFD must supply its raw "
+                "id_to_token form: it is a partial UTF-8 byte token and is keyed "
+                "by that raw form, not by normalized text"
+            )
+        return raw_token
+    normalized = normalize_engram_token_text(decoded_text)
+    return normalized if normalized else decoded_text
+
+
+def build_engram_compressed_token_map(
+    decoded_texts: Sequence[str], raw_tokens: Sequence[Optional[str]]
+) -> Tuple[List[int], int]:
+    """Map every raw token id onto the smaller Engram id space.
+
+    Returns ``(lookup, compressed_vocab_size)`` where ``lookup[token_id]`` is the
+    compressed id. Compressed ids are handed out in first-seen token-id order,
+    exactly as the official dict insertion does, so the mapping is fully
+    deterministic given the tokenizer.
+
+    Takes already-decoded text rather than a tokenizer so the normalization
+    contract -- the part this repository owns -- is testable without a
+    tokenizer backend. See build_engram_compressed_token_map_from_tokenizer for
+    the driver that reads those two lists off a real fast tokenizer.
+    """
+    decoded = list(decoded_texts)
+    raw = list(raw_tokens)
+    if len(decoded) != len(raw):
+        raise ValueError(
+            f"decoded_texts ({len(decoded)}) and raw_tokens ({len(raw)}) must "
+            "describe the same vocabulary, one entry per token id"
+        )
+    if not decoded:
+        raise ValueError("an empty vocabulary has no Engram compressed map")
+    key_to_new: Dict[str, int] = {}
+    lookup = [0] * len(decoded)
+    for token_id, (text, raw_token) in enumerate(zip(decoded, raw)):
+        key = engram_compressed_token_key(text, raw_token)
+        new_id = key_to_new.get(key)
+        if new_id is None:
+            new_id = len(key_to_new)
+            key_to_new[key] = new_id
+        lookup[token_id] = new_id
+    return lookup, len(key_to_new)
+
+
+def build_engram_compressed_token_map_from_tokenizer(
+    tokenizer,
+) -> Tuple[List[int], int]:
+    """build_engram_compressed_token_map driven by a real fast tokenizer.
+
+    Uses the raw Rust backend directly, matching what training decoded with
+    (no clean_up_tokenization_spaces, no skip_special_tokens).
+    """
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        raise ValueError(
+            "the Engram compressed vocabulary is built from the raw fast-tokenizer "
+            "backend (tokenizer.backend_tokenizer); a slow tokenizer decodes "
+            "differently and would produce a different compressed vocab size, "
+            "which silently rehashes both Engram tables"
+        )
+    size = len(tokenizer)
+    decoded, raw = [], []
+    for token_id in range(size):
+        decoded.append(backend.decode([token_id], skip_special_tokens=False))
+        raw.append(backend.id_to_token(token_id))
+    return build_engram_compressed_token_map(decoded, raw)
+
+
+def _is_prime(candidate: int) -> bool:
+    """Deterministic trial-division primality test.
+
+    The official layout draws primes just above engram_vocab_size (16,000,000),
+    so the loop below runs to ~4,000 per candidate: exact, dependency-free and
+    far cheaper than taking a sympy dependency for this one call.
+    """
+    if candidate < 2:
+        return False
+    if candidate < 4:
+        return True
+    if candidate % 2 == 0:
+        return False
+    factor = 3
+    while factor * factor <= candidate:
+        if candidate % factor == 0:
+            return False
+        factor += 2
+    return True
+
+
+def find_next_prime(start: int, seen_primes: Iterable[int]) -> int:
+    """The smallest prime strictly above start that has not been handed out yet.
+
+    Faithful to inference/engram.py find_next_prime. Drawing in strictly
+    increasing order and never reusing a prime is what keeps every
+    (n-gram size, head) bucket range disjoint inside one table.
+    """
+    seen = (
+        seen_primes if isinstance(seen_primes, (set, frozenset)) else set(seen_primes)
+    )
+    candidate = start + 1
+    while not _is_prime(candidate) or candidate in seen:
+        candidate += 1
+    return candidate
+
+
+def compute_engram_hash_multipliers(
+    layer_ids: Sequence[int], max_ngram_size: int, compressed_vocab_size: int
+) -> np.ndarray:
+    """One odd int64 multiplier per (Engram layer, look-back).
+
+    Faithful to inference/engram.py compute_hash_multipliers: a separate numpy
+    PCG64 stream seeded ENGRAM_RNG_LAYER_SEED_STRIDE * layer_id per layer,
+    values drawn in [0, bound) and mapped to 2 * v + 1 so every multiplier is
+    odd. bound is chosen so compressed_id * multiplier cannot overflow int64 --
+    the running hash is an XOR of such products, so a wrap would not merely be
+    inexact, it would alias unrelated n-grams onto the same row.
+
+    Derived from the *compressed* vocab size, not the raw one, which is why
+    build_engram_compressed_token_map must reproduce the official normalizer
+    chain exactly.
+    """
+    if max_ngram_size < 1:
+        raise ValueError(f"engram_max_ngram_size must be >= 1, got {max_ngram_size}")
+    if compressed_vocab_size < 1:
+        raise ValueError(
+            f"engram_compressed_vocab_size must be >= 1, got {compressed_vocab_size}"
+        )
+    max_long = int(np.iinfo(np.int64).max)
+    multiplier_bound = max(1, (max_long // compressed_vocab_size) // 2)
+    rows = []
+    for layer_id in layer_ids:
+        generator = np.random.default_rng(ENGRAM_RNG_LAYER_SEED_STRIDE * int(layer_id))
+        values = generator.integers(
+            low=0, high=multiplier_bound, size=(max_ngram_size,), dtype=np.int64
+        )
+        rows.append(values * 2 + 1)
+    return np.stack(rows).astype(np.int64)
+
+
+@dataclass(frozen=True)
+class EngramLayout:
+    """Bucket layout of the n-gram hash tables (inference/engram.py EngramLayout).
+
+    A position is hashed as max_ngram_size - 1 n-grams (2-gram up to
+    max_ngram_size-gram), each split over n_heads heads. Every
+    (n-gram size, head) pair owns its own prime-sized bucket range inside that
+    layer table; primes are drawn in strictly increasing order and never
+    reused, so the ranges are disjoint and their concatenation tiles the table.
+
+    For the pinned official config this tiling is exact, not approximate: the
+    24 primes of Engram layer 1 sum to 384,006,168 and the 24 primes of layer
+    14 sum to 384,016,682 -- precisely the two engram_num_embeddings counts.
+    """
+
+    max_ngram_size: int
+    layer_ids: Tuple[int, ...]
+    num_embeddings: Tuple[int, ...]
+    primes: Tuple[Tuple[Tuple[int, ...], ...], ...]
+    n_heads: int
+    head_dim: int
+
+    @property
+    def n_hash_cols(self) -> int:
+        """Hash ids per token per Engram layer: 24 for the official config."""
+        return (self.max_ngram_size - 1) * self.n_heads
+
+    def flat_primes(self, layer_hash_index: int) -> Tuple[int, ...]:
+        """The bucket moduli of one layer, n-gram-size major and head minor."""
+        return tuple(
+            p for per_ngram in self.primes[layer_hash_index] for p in per_ngram
+        )
+
+    def bucket_offsets(self) -> np.ndarray:
+        """[n_engram_layers, n_hash_cols] base row of each bucket range."""
+        return np.array(
+            [
+                np.cumsum([0, *self.flat_primes(i)[:-1]])
+                for i in range(len(self.layer_ids))
+            ],
+            dtype=np.int64,
+        )
+
+    def bucket_span(self, layer_hash_index: int) -> int:
+        """Rows the bucket ranges of one layer address, i.e. one past the max id."""
+        return int(sum(self.flat_primes(layer_hash_index)))
+
+    def prime_array(self) -> np.ndarray:
+        """[n_engram_layers, max_ngram_size - 1, n_heads] bucket moduli."""
+        return np.array(self.primes, dtype=np.int64)
+
+    @classmethod
+    def from_config(cls, config: TextConfig) -> Optional["EngramLayout"]:
+        """Build the layout for a config, or None when Engram is disabled.
+
+        Fails closed on every malformed layout the official EngramLayout would
+        accept and then mis-address. The load-bearing one is a bucket span
+        wider than the table it indexes: that produces row ids past the end of
+        the shard, which ParallelEngramEmbedding masks silently to zero rather
+        than reporting, so it would degrade output instead of failing.
+        """
+        layer_ids = tuple(int(i) for i in config.engram_layer_ids)
+        if not layer_ids:
+            return None
+        max_ngram_size = int(config.engram_max_ngram_size)
+        n_heads = int(config.engram_n_heads)
+        head_dim = int(config.engram_head_dim)
+        num_embeddings = tuple(int(n) for n in config.engram_num_embeddings)
+        vocab_size = int(config.engram_vocab_size)
+
+        if max_ngram_size < 2:
+            raise ValueError(
+                "engram_max_ngram_size must be >= 2 when engram_layer_ids is "
+                f"non-empty, got {max_ngram_size}: a layer that hashes no n-gram "
+                "produces no hash ids at all"
+            )
+        if n_heads < 1:
+            raise ValueError(f"engram_n_heads must be >= 1, got {n_heads}")
+        if head_dim < 1 or head_dim % ENGRAM_FP8_BLOCK_SIZE:
+            raise ValueError(
+                "engram_head_dim must be a positive multiple of the E8M0 block "
+                f"size {ENGRAM_FP8_BLOCK_SIZE}, got {head_dim}: a row carries "
+                "exactly head_dim // block scale codes and a partial block has "
+                "no scale to apply"
+            )
+        if vocab_size < 2:
+            raise ValueError(
+                f"engram_vocab_size must be >= 2, got {vocab_size}: it is the "
+                "value each (n-gram size, head) bucket range starts searching "
+                "for its prime modulus from"
+            )
+        if len(num_embeddings) != len(layer_ids):
+            raise ValueError(
+                f"engram_num_embeddings has {len(num_embeddings)} entries but "
+                f"engram_layer_ids has {len(layer_ids)}: exactly one table row "
+                "count per Engram layer is required"
+            )
+        if any(a >= b for a, b in zip(layer_ids, layer_ids[1:])):
+            raise ValueError(
+                f"engram_layer_ids must be strictly increasing, got {layer_ids}"
+            )
+        n_layers = int(config.num_hidden_layers)
+        if any(not 0 <= i < n_layers for i in layer_ids):
+            raise ValueError(
+                f"engram_layer_ids {layer_ids} must all lie in "
+                f"[0, num_hidden_layers={n_layers})"
+            )
+
+        primes: List[Tuple[Tuple[int, ...], ...]] = []
+        seen = set()
+        for _ in layer_ids:
+            per_ngram = []
+            for _ in range(max_ngram_size - 1):
+                sizes, current = [], vocab_size - 1
+                for _ in range(n_heads):
+                    current = find_next_prime(current, seen)
+                    seen.add(current)
+                    sizes.append(current)
+                per_ngram.append(tuple(sizes))
+            primes.append(tuple(per_ngram))
+
+        layout = cls(
+            max_ngram_size=max_ngram_size,
+            layer_ids=layer_ids,
+            num_embeddings=num_embeddings,
+            primes=tuple(primes),
+            n_heads=n_heads,
+            head_dim=head_dim,
+        )
+        for index, layer_id in enumerate(layer_ids):
+            rows = num_embeddings[index]
+            if rows < 1:
+                raise ValueError(
+                    f"engram_num_embeddings[{index}] (layer {layer_id}) must be "
+                    f"positive, got {rows}"
+                )
+            span = layout.bucket_span(index)
+            if span > rows:
+                raise ValueError(
+                    f"Engram layer {layer_id} bucket ranges span {span} rows but "
+                    f"engram_num_embeddings[{index}] declares only {rows}: the "
+                    "hash would address past the end of the table"
+                )
+        return layout
+
+
+def validate_engram_config(config: TextConfig) -> Optional[EngramLayout]:
+    """Fail closed on every Engram config the official modules cannot express."""
+    layout = EngramLayout.from_config(config)
+    if layout is None:
+        return None
+    if int(config.engram_compressed_vocab_size) < 1:
+        raise ValueError(
+            "engram_compressed_vocab_size must be positive: every hash "
+            "multiplier is derived from it, so a wrong value silently rehashes "
+            "both tables instead of failing"
+        )
+    if not 0 <= int(config.engram_pad_token_id) < int(config.vocab_size):
+        raise ValueError(
+            f"engram_pad_token_id={config.engram_pad_token_id} is outside "
+            f"[0, vocab_size={config.vocab_size}): it fills the n-gram slots of "
+            "positions with no usable history"
+        )
+    if int(config.hc_mult) < 1:
+        raise ValueError(
+            f"hc_mult must be >= 1, got {config.hc_mult}: Engram writes into the "
+            "hc_mult-expanded residual stream"
+        )
+    return layout
+
+
+class EngramNgramHasher:
+    """Maps each position to the hash ids of the n-grams ending there.
+
+    Faithful to inference/engram.py NgramHashState. Raw token ids go through
+    the compressed map, then each position is hashed together with the
+    max_ngram_size - 1 tokens before it. Look-back stops at the start of the
+    sequence and at any dead token (an image span, cached as ENGRAM_DEAD_TOKEN),
+    so an n-gram never spans one; blocked slots are filled with the compressed
+    pad id. The XOR is accumulated one look-back at a time, so the running
+    value after step i is the hash of the (i+1)-gram, and each lands in its own
+    prime-sized bucket range.
+
+    The history cache is [max_batch_size, max_seq_len] int64 and is carried
+    across the prefill/decode split. It is an always-real, non-quantizable
+    8 bytes/token/batch fixed cost, and is shared once by *both* Engram layers
+    rather than duplicated per layer -- the per-layer difference lives entirely
+    in the multipliers and the bucket primes.
+
+    Deliberately host-side (numpy int64) rather than device-side. The ids this
+    produces are not activations: they are row addresses that must reach the
+    host anyway to drive the file-backed gather in BoundedEngramRowCache, and
+    int64 multiply/XOR has to be exact or unrelated n-grams alias onto one row.
+    """
+
+    def __init__(
+        self,
+        layout: EngramLayout,
+        token_map: Sequence[int],
+        pad_token_id: int,
+        compressed_vocab_size: int,
+        max_batch_size: int = 1,
+        max_seq_len: int = 4096,
+    ):
+        if max_batch_size < 1 or max_seq_len < 1:
+            raise ValueError(
+                f"max_batch_size={max_batch_size} and max_seq_len={max_seq_len} "
+                "must both be positive"
+            )
+        token_map_arr = np.asarray(token_map, dtype=np.int64)
+        if token_map_arr.ndim != 1 or token_map_arr.size < 1:
+            raise ValueError(
+                "token_map must be a 1-D lookup with one compressed id per raw "
+                f"token id, got shape {token_map_arr.shape}"
+            )
+        if int(token_map_arr.min()) < 0:
+            raise ValueError("token_map contains a negative compressed id")
+        observed = int(token_map_arr.max()) + 1
+        if observed > compressed_vocab_size:
+            raise ValueError(
+                f"token_map addresses {observed} compressed ids but "
+                f"engram_compressed_vocab_size is {compressed_vocab_size}: every "
+                "hash multiplier is derived from that size, so a mismatch "
+                "rehashes the whole table"
+            )
+        if not 0 <= pad_token_id < token_map_arr.size:
+            raise ValueError(
+                f"engram_pad_token_id={pad_token_id} is outside the token_map "
+                f"range [0, {token_map_arr.size})"
+            )
+
+        self.layout = layout
+        self.vocab_size = int(token_map_arr.size)
+        self.compressed_vocab_size = int(compressed_vocab_size)
+        self.max_batch_size = int(max_batch_size)
+        self.max_seq_len = int(max_seq_len)
+        self.token_map = token_map_arr
+        self.pad_id = int(token_map_arr[pad_token_id])
+        self.primes = layout.prime_array()
+        self.offsets = layout.bucket_offsets()
+        self.multipliers = compute_engram_hash_multipliers(
+            layout.layer_ids, layout.max_ngram_size, self.compressed_vocab_size
+        )
+        # Initialized to DEAD, not to zero. The reference uses torch.empty and
+        # relies on start_pos advancing monotonically from 0 so a slot is
+        # always written before it is read; seeding DEAD instead means a
+        # misuse blocks look-back rather than inventing a phantom token-0
+        # n-gram, which would be indistinguishable from a real one.
+        self.cache = np.full(
+            (self.max_batch_size, self.max_seq_len), ENGRAM_DEAD_TOKEN, dtype=np.int64
+        )
+
+    def reset(self) -> None:
+        """Drop the compressed-id history, e.g. between unrelated sequences.
+
+        Every slot returns to DEAD, so the next sequence look-back stops at
+        its own start instead of reaching into the previous one.
+        """
+        self.cache[...] = ENGRAM_DEAD_TOKEN
+
+    def nbytes(self) -> int:
+        """Bytes held by the shared history cache (8 per token per batch row)."""
+        return int(self.cache.nbytes)
+
+    def hash_ids(
+        self,
+        input_ids,
+        start_pos: int = 0,
+        token_mask=None,
+    ) -> np.ndarray:
+        """Host-side [B, L, n_engram_layers, n_hash_cols] int64 row ids.
+
+        token_mask is [B, L] and False for tokens that take no part in an
+        n-gram (image spans), matching Transformer.forward, which passes
+        ~image_mask.
+        """
+        ids = np.asarray(input_ids)
+        if ids.ndim != 2:
+            raise ValueError(
+                f"input_ids must be [batch, seqlen], got shape {ids.shape}"
+            )
+        ids = ids.astype(np.int64, copy=False)
+        batch, seqlen = ids.shape
+        if batch > self.max_batch_size:
+            raise ValueError(
+                f"batch {batch} exceeds max_batch_size={self.max_batch_size}: the "
+                "shared n-gram history cache is preallocated and never grows"
+            )
+        if start_pos < 0 or start_pos + seqlen > self.max_seq_len:
+            raise ValueError(
+                f"positions [{start_pos}, {start_pos + seqlen}) fall outside the "
+                f"history cache range [0, max_seq_len={self.max_seq_len})"
+            )
+        if seqlen and (int(ids.min()) < 0 or int(ids.max()) >= self.vocab_size):
+            raise ValueError(
+                f"input_ids must lie in [0, vocab_size={self.vocab_size}); got "
+                f"[{int(ids.min())}, {int(ids.max())}]"
+            )
+
+        compressed = self.token_map[ids]
+        if token_mask is not None:
+            mask = np.asarray(token_mask).astype(bool, copy=False)
+            if mask.shape != ids.shape:
+                raise ValueError(
+                    f"token_mask shape {mask.shape} must match input_ids shape "
+                    f"{ids.shape}"
+                )
+            compressed = np.where(mask, compressed, ENGRAM_DEAD_TOKEN)
+        self.cache[:batch, start_pos : start_pos + seqlen] = compressed
+
+        positions = np.broadcast_to(
+            np.arange(start_pos, start_pos + seqlen, dtype=np.int64), (batch, seqlen)
+        )
+        history = self.cache[:batch]
+        blocked = np.zeros_like(positions, dtype=bool)
+        tokens = []
+        for shift in range(self.layout.max_ngram_size):
+            source = np.take_along_axis(
+                history, np.clip(positions - shift, 0, None), axis=1
+            )
+            blocked = blocked | (positions < shift) | (source == ENGRAM_DEAD_TOKEN)
+            tokens.append(np.where(blocked, self.pad_id, source))
+        stacked = np.stack(tokens, axis=-1)
+
+        products = stacked[:, :, None, :] * self.multipliers
+        rolling = products[..., 0]
+        hashes = []
+        for i in range(1, self.layout.max_ngram_size):
+            rolling = np.bitwise_xor(rolling, products[..., i])
+            hashes.append(rolling[..., None] % self.primes[:, i - 1])
+        return np.concatenate(hashes, axis=-1) + self.offsets
+
+    def __call__(self, input_ids, start_pos: int = 0, token_mask=None) -> mx.array:
+        """hash_ids as an mx.array, matching the reference return type."""
+        return mx.array(self.hash_ids(input_ids, start_pos, token_mask))
+
+
+def dequantize_engram_rows(
+    weight, scale, block_size: int = ENGRAM_FP8_BLOCK_SIZE, dtype=mx.bfloat16
+) -> mx.array:
+    """Row-level FP8(E4M3) x E8M0 dequantization for gathered Engram rows.
+
+    Faithful to inference/model.py ParallelEngramEmbedding.forward:
+    values.float().unflatten(-1, (-1, block_size)) * scales.float().unsqueeze(-1),
+    flattened back and cast to bfloat16.
+
+    Deliberately *not* dequantize_fp8_block. A packed Linear weight carries a
+    2-D (out_block, in_block) scale grid; an Engram scale is per row and 1-D
+    along the row, one E8M0 code per block_size contiguous columns
+    (head_dim // block_size == 8 codes for the official 256-wide rows). Reusing
+    the 2-D tiling here would mis-partition the scales.
+
+    Takes only the rows actually gathered. There is no call shape that decodes
+    a whole table: weight is [n_rows, dim], and n_rows comes from the caller.
+    """
+    if block_size < 1:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    weight_arr = np.asarray(weight)
+    scale_arr = np.asarray(scale)
+    if weight_arr.ndim != 2 or scale_arr.ndim != 2:
+        raise ValueError(
+            "dequantize_engram_rows expects 2-D [n_rows, dim] weight and "
+            f"[n_rows, dim // block] scale, got weight.shape={weight_arr.shape} "
+            f"scale.shape={scale_arr.shape}"
+        )
+    n_rows, dim = weight_arr.shape
+    if scale_arr.shape[0] != n_rows:
+        raise ValueError(f"weight has {n_rows} rows but scale has {scale_arr.shape[0]}")
+    if dim % block_size:
+        raise ValueError(
+            f"row width {dim} is not divisible by block_size={block_size}; the "
+            "Engram scale grid never carries a partial trailing block"
+        )
+    if scale_arr.shape[1] != dim // block_size:
+        raise ValueError(
+            f"scale shape {scale_arr.shape} does not match the expected "
+            f"{(n_rows, dim // block_size)} row-scale grid for a [{n_rows}, {dim}] "
+            f"row block at block_size={block_size}"
+        )
+    if n_rows == 0:
+        return mx.zeros((0, dim), dtype=dtype)
+    values = mx.from_fp8(mx.array(weight_arr.astype(np.uint8)), dtype=mx.float32)
+    scales = decode_e8m0_scale(mx.array(scale_arr.astype(np.uint8)))
+    values = values.reshape(n_rows, dim // block_size, block_size)
+    values = values * scales[:, :, None]
+    return values.reshape(n_rows, dim).astype(dtype)
+
+
+class EngramRowStore:
+    """Read-only, row-addressed view of one packed Engram table shard.
+
+    The whole point of this interface is what it does *not* offer: there is no
+    way to ask it for the table. read_rows takes explicit row ids and returns
+    exactly that many packed rows, so peak memory is bounded by the request,
+    never by the ~91.6-98.3 GiB the two official tables occupy.
+    """
+
+    num_rows: int = 0
+    dim: int = 0
+    block_size: int = ENGRAM_FP8_BLOCK_SIZE
+
+    @property
+    def scale_dim(self) -> int:
+        return self.dim // self.block_size
+
+    @property
+    def row_nbytes(self) -> int:
+        """Packed bytes per row: dim E4M3 codes plus dim // block E8M0 codes."""
+        return self.dim + self.scale_dim
+
+    def read_rows(self, row_ids) -> Tuple[np.ndarray, np.ndarray]:
+        """Return ([n, dim] uint8 weight, [n, dim // block] uint8 scale)."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+# safetensors dtype tags. The official tables are float8_e4m3fn rows with
+# float8_e8m0fnu scales; U8 is also accepted because both are byte-identical
+# containers and not every writer can emit the fp8 tags. Anything else is
+# refused rather than reinterpreted.
+ENGRAM_WEIGHT_SAFETENSORS_DTYPES = ("F8_E4M3", "U8")
+ENGRAM_SCALE_SAFETENSORS_DTYPES = ("F8_E8M0", "U8")
+_SAFETENSORS_HEADER_LIMIT = 100_000_000
+
+
+class SafetensorsEngramRowStore(EngramRowStore):
+    """A file-backed EngramRowStore that reads individual rows by byte range.
+
+    Parses the safetensors header itself and then seeks to the exact bytes of
+    each requested row. It deliberately does not go through mx.load or any
+    other whole-tensor loader: loading either official Engram tensor that way
+    would materialize ~91.6-98.3 GiB. This is the same per-row access pattern
+    the Plan 0051 M1 layout probe validated at the storage-format level with a
+    byte-range HTTP GET, applied locally to a real file.
+
+    Reading is O(rows requested), so a tiny fixture and a 384-million-row shard
+    exercise the identical code path.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        weight_key: str = "weight",
+        scale_key: str = "scale",
+        block_size: int = ENGRAM_FP8_BLOCK_SIZE,
+    ):
+        if block_size < 1:
+            raise ValueError(f"block_size must be positive, got {block_size}")
+        self.path = str(path)
+        self.weight_key = weight_key
+        self.scale_key = scale_key
+        self.block_size = int(block_size)
+        self.rows_read = 0
+        self.bytes_read = 0
+        self._handle = None
+
+        with open(self.path, "rb") as handle:
+            raw_len = handle.read(8)
+            if len(raw_len) != 8:
+                raise ValueError(
+                    f"{self.path} is too short to be a safetensors file (no 8-byte "
+                    "header length)"
+                )
+            header_len = int.from_bytes(raw_len, "little", signed=False)
+            if header_len < 2 or header_len > _SAFETENSORS_HEADER_LIMIT:
+                raise ValueError(
+                    f"{self.path} declares an implausible safetensors header "
+                    f"length of {header_len} bytes"
+                )
+            raw_header = handle.read(header_len)
+            if len(raw_header) != header_len:
+                raise ValueError(f"{self.path} has a truncated safetensors header")
+            try:
+                header = json.loads(raw_header.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"{self.path} has an unreadable safetensors header: {exc}"
+                ) from exc
+            handle.seek(0, 2)
+            file_size = handle.tell()
+
+        if not isinstance(header, dict):
+            raise ValueError(f"{self.path} safetensors header is not a JSON object")
+        self._data_start = 8 + header_len
+
+        weight_shape, weight_begin = self._entry(
+            header, self.weight_key, ENGRAM_WEIGHT_SAFETENSORS_DTYPES, file_size
+        )
+        scale_shape, scale_begin = self._entry(
+            header, self.scale_key, ENGRAM_SCALE_SAFETENSORS_DTYPES, file_size
+        )
+        self.num_rows, self.dim = weight_shape
+        if self.num_rows < 1 or self.dim < 1:
+            raise ValueError(
+                f"{self.path}:{self.weight_key} has an empty shape {weight_shape}"
+            )
+        if self.dim % self.block_size:
+            raise ValueError(
+                f"{self.path}:{self.weight_key} row width {self.dim} is not "
+                f"divisible by block_size={self.block_size}"
+            )
+        expected_scale = (self.num_rows, self.dim // self.block_size)
+        if tuple(scale_shape) != expected_scale:
+            raise ValueError(
+                f"{self.path}:{self.scale_key} has shape {tuple(scale_shape)} but "
+                f"the [{self.num_rows}, {self.dim}] weight at "
+                f"block_size={self.block_size} requires {expected_scale}"
+            )
+        self._weight_begin = self._data_start + weight_begin
+        self._scale_begin = self._data_start + scale_begin
+
+    def _entry(self, header, key, allowed_dtypes, file_size):
+        if key not in header:
+            named = sorted(k for k in header if k != "__metadata__")
+            raise ValueError(
+                f"{self.path} has no tensor named {key!r}; found " f"{named}"
+            )
+        entry = header[key]
+        dtype = entry.get("dtype")
+        if dtype not in allowed_dtypes:
+            raise ValueError(
+                f"{self.path}:{key} has dtype {dtype!r}; the Engram row store "
+                f"accepts only {allowed_dtypes} (one byte per element)"
+            )
+        shape = entry.get("shape")
+        if not isinstance(shape, list) or len(shape) != 2:
+            raise ValueError(
+                f"{self.path}:{key} must be a 2-D tensor, got shape {shape!r}"
+            )
+        offsets = entry.get("data_offsets")
+        if not isinstance(offsets, list) or len(offsets) != 2:
+            raise ValueError(
+                f"{self.path}:{key} has malformed data_offsets {offsets!r}"
+            )
+        begin, end = int(offsets[0]), int(offsets[1])
+        expected = int(shape[0]) * int(shape[1])
+        if begin < 0 or end - begin != expected:
+            raise ValueError(
+                f"{self.path}:{key} spans {end - begin} bytes but shape {shape} at "
+                f"one byte per element needs {expected}"
+            )
+        if self._data_start + end > file_size:
+            raise ValueError(
+                f"{self.path}:{key} ends at byte {self._data_start + end} but the "
+                f"file is only {file_size} bytes long"
+            )
+        return (int(shape[0]), int(shape[1])), begin
+
+    def _file(self):
+        if self._handle is None or self._handle.closed:
+            self._handle = open(self.path, "rb")
+        return self._handle
+
+    def read_rows(self, row_ids) -> Tuple[np.ndarray, np.ndarray]:
+        ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+        count = int(ids.size)
+        weight = np.empty((count, self.dim), dtype=np.uint8)
+        scale = np.empty((count, self.scale_dim), dtype=np.uint8)
+        if count == 0:
+            return weight, scale
+        if int(ids.min()) < 0 or int(ids.max()) >= self.num_rows:
+            raise IndexError(
+                f"row ids [{int(ids.min())}, {int(ids.max())}] fall outside "
+                f"[0, num_rows={self.num_rows}) of {self.path}"
+            )
+        handle = self._file()
+        for position, row_id in enumerate(ids.tolist()):
+            handle.seek(self._weight_begin + row_id * self.dim)
+            chunk = handle.read(self.dim)
+            if len(chunk) != self.dim:
+                raise ValueError(
+                    f"{self.path}:{self.weight_key} row {row_id} is truncated"
+                )
+            weight[position] = np.frombuffer(chunk, dtype=np.uint8)
+            handle.seek(self._scale_begin + row_id * self.scale_dim)
+            chunk = handle.read(self.scale_dim)
+            if len(chunk) != self.scale_dim:
+                raise ValueError(
+                    f"{self.path}:{self.scale_key} row {row_id} is truncated"
+                )
+            scale[position] = np.frombuffer(chunk, dtype=np.uint8)
+        self.rows_read += count
+        self.bytes_read += count * self.row_nbytes
+        return weight, scale
+
+    def close(self) -> None:
+        if self._handle is not None and not self._handle.closed:
+            self._handle.close()
+        self._handle = None
+
+
+class EngramCacheStats:
+    """Observable cost of an Engram gather: what was asked for vs what was read."""
+
+    __slots__ = (
+        "calls",
+        "requested_rows",
+        "unique_rows",
+        "hits",
+        "misses",
+        "rows_fetched",
+        "evictions",
+    )
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.calls = 0
+        self.requested_rows = 0
+        self.unique_rows = 0
+        self.hits = 0
+        self.misses = 0
+        self.rows_fetched = 0
+        self.evictions = 0
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{name}={getattr(self, name)}" for name in self.__slots__)
+        return f"EngramCacheStats({fields})"
+
+
+class BoundedEngramRowCache:
+    """A bounded LRU of packed Engram rows in front of an EngramRowStore.
+
+    Three properties matter and are all directly observable through stats and
+    nbytes():
+
+      * **Dedup.** A gather of B x L x 24 hash ids contains heavy repetition
+        (the same n-gram recurs, and blocked look-backs all collapse onto the
+        pad n-gram). Only distinct row ids are ever read from the store and
+        only distinct rows are ever dequantized; the request order is restored
+        with an index take afterwards.
+      * **Bounded residency.** At most max_rows packed rows are retained.
+        Residency is what the bound applies to, so cache memory is
+        max_rows * (dim + dim // block) bytes regardless of table size or of
+        how many rows the caller has asked for over time.
+      * **Packed at rest.** Rows are cached in their packed FP8 + E8M0 form and
+        dequantized per lookup, exactly as ParallelEngramEmbedding does. Caching
+        decoded rows would nearly double residency for no fidelity gain.
+
+    A single gather whose distinct row count exceeds max_rows is served
+    correctly rather than refused: the call materializes the rows it was asked
+    for, and residency afterwards is still bounded by max_rows.
+    """
+
+    def __init__(self, store: EngramRowStore, max_rows: int = 8192):
+        if max_rows < 1:
+            raise ValueError(
+                f"max_rows must be at least 1, got {max_rows}: a zero-row cache "
+                "cannot hold the row it just fetched"
+            )
+        if store.dim < 1 or store.num_rows < 1:
+            raise ValueError(
+                f"store must expose a positive num_rows/dim, got "
+                f"num_rows={store.num_rows} dim={store.dim}"
+            )
+        self.store = store
+        self.max_rows = int(max_rows)
+        self.stats = EngramCacheStats()
+        self._entries = OrderedDict()
+
+    @property
+    def dim(self) -> int:
+        return self.store.dim
+
+    @property
+    def block_size(self) -> int:
+        return self.store.block_size
+
+    @property
+    def resident_rows(self) -> int:
+        return len(self._entries)
+
+    def nbytes(self) -> int:
+        """Packed bytes currently resident. Grows with the bound, not the table."""
+        return self.resident_rows * self.store.row_nbytes
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def gather_packed(
+        self, row_ids
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return (unique_ids, packed weight, packed scale, inverse index).
+
+        weight is [n_unique, dim] and inverse maps each requested position onto
+        its row in that block, so the caller can restore request order without
+        ever holding a duplicate copy of a row.
+        """
+        ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+        self.stats.calls += 1
+        self.stats.requested_rows += int(ids.size)
+        if ids.size == 0:
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0, self.dim), dtype=np.uint8),
+                np.empty((0, self.store.scale_dim), dtype=np.uint8),
+                np.empty((0,), dtype=np.int64),
+            )
+
+        # First-seen order, not sorted order: the LRU recency this produces is
+        # the order the caller actually asked in.
+        unique_ids, first_index, inverse = np.unique(
+            ids, return_index=True, return_inverse=True
+        )
+        order = np.argsort(first_index)
+        unique_ids = unique_ids[order]
+        remap = np.empty(order.size, dtype=np.int64)
+        remap[order] = np.arange(order.size, dtype=np.int64)
+        inverse = remap[inverse.reshape(-1)]
+        self.stats.unique_rows += int(unique_ids.size)
+
+        missing = [int(i) for i in unique_ids.tolist() if i not in self._entries]
+        self.stats.hits += int(unique_ids.size) - len(missing)
+        self.stats.misses += len(missing)
+        if missing:
+            fetched_w, fetched_s = self.store.read_rows(missing)
+            self.stats.rows_fetched += len(missing)
+            for position, row_id in enumerate(missing):
+                self._entries[row_id] = (fetched_w[position], fetched_s[position])
+
+        weight = np.empty((unique_ids.size, self.dim), dtype=np.uint8)
+        scale = np.empty((unique_ids.size, self.store.scale_dim), dtype=np.uint8)
+        for position, row_id in enumerate(unique_ids.tolist()):
+            entry = self._entries[int(row_id)]
+            weight[position] = entry[0]
+            scale[position] = entry[1]
+            self._entries.move_to_end(int(row_id))
+
+        while len(self._entries) > self.max_rows:
+            self._entries.popitem(last=False)
+            self.stats.evictions += 1
+        return unique_ids, weight, scale, inverse
+
+    def gather_rows(self, row_ids, dtype=mx.bfloat16) -> mx.array:
+        """Dequantized [n_requested, dim] rows, in request order."""
+        _, weight, scale, inverse = self.gather_packed(row_ids)
+        rows = dequantize_engram_rows(weight, scale, self.block_size, dtype)
+        if rows.shape[0] == 0:
+            return rows
+        return mx.take(rows, mx.array(inverse.astype(np.int32)), axis=0)
+
+
+class DeepseekV41EngramEmbedding(nn.Module):
+    """The row-sharded n-gram hash table (inference/model.py ParallelEngramEmbedding).
+
+    The table stays packed FP8 on disk and rows are dequantized on lookup. This
+    module therefore holds **no parameters at all**: there is no dense
+    [num_embeddings, dim] array anywhere in it, and
+    ``tree_flatten(self.parameters())`` is empty by construction. All state is
+    the injected BoundedEngramRowCache and its file-backed store.
+
+    Sharding matches the reference exactly: each of world_size ranks owns
+    ``ceil(num_embeddings / world_size)`` contiguous rows, ids outside the
+    local shard are zero-masked, and the per-rank partial results are summed
+    with an all-reduce. That reducer is an explicit constructor argument rather
+    than an implicit global: at world_size == 1 none is needed and none is
+    used, and at world_size > 1 a missing one fails loud instead of silently
+    returning this rank's fragment of the row as if it were the whole row.
+
+    Shard-relative masking is the reference behaviour and is kept. A *globally*
+    out-of-table id is a different thing -- it can only come from a malformed
+    layout, and the reference would mask it to zero indistinguishably from a
+    legitimate remote row -- so that case is refused here instead.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        dim: int,
+        cache: BoundedEngramRowCache,
+        rank: int = 0,
+        world_size: int = 1,
+        all_reduce: Optional[Callable[[mx.array], mx.array]] = None,
+        block_size: int = ENGRAM_FP8_BLOCK_SIZE,
+    ):
+        super().__init__()
+        if num_embeddings < 1:
+            raise ValueError(f"num_embeddings must be positive, got {num_embeddings}")
+        if dim < 1 or dim % block_size:
+            raise ValueError(
+                f"dim must be a positive multiple of block_size={block_size}, got "
+                f"{dim}"
+            )
+        if world_size < 1:
+            raise ValueError(f"world_size must be positive, got {world_size}")
+        if not 0 <= rank < world_size:
+            raise ValueError(
+                f"rank {rank} is outside the range [0, world_size={world_size})"
+            )
+        if cache.dim != dim:
+            raise ValueError(
+                f"the row store serves {cache.dim}-wide rows but this embedding "
+                f"expects {dim}"
+            )
+        if cache.block_size != block_size:
+            raise ValueError(
+                f"the row store uses block_size={cache.block_size} but this "
+                f"embedding expects {block_size}"
+            )
+
+        self.num_embeddings = int(num_embeddings)
+        self.dim = int(dim)
+        self.block_size = int(block_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.part_num_embeddings = -(-self.num_embeddings // self.world_size)
+        self.vocab_start_idx = self.rank * self.part_num_embeddings
+        self.vocab_end_idx = self.vocab_start_idx + self.part_num_embeddings
+        if cache.store.num_rows != self.part_num_embeddings:
+            raise ValueError(
+                f"the row store holds {cache.store.num_rows} rows but rank "
+                f"{self.rank} of {self.world_size} owns "
+                f"{self.part_num_embeddings} rows of the {self.num_embeddings}-row "
+                "table; every rank allocates ceil(rows / world_size), padding "
+                "included"
+            )
+        self.cache = cache
+        self.all_reduce = all_reduce
+
+    def nbytes(self) -> int:
+        """Resident bytes. A function of the cache bound, never of the table."""
+        return self.cache.nbytes()
+
+    def __call__(self, indices, dtype=mx.bfloat16) -> mx.array:
+        ids = np.asarray(indices)
+        ids = ids.astype(np.int64, copy=False)
+        shape = tuple(ids.shape)
+        if ids.size == 0:
+            return mx.zeros(shape + (self.dim,), dtype=dtype)
+        low, high = int(ids.min()), int(ids.max())
+        if low < 0 or high >= self.num_embeddings:
+            raise IndexError(
+                f"Engram row ids [{low}, {high}] fall outside "
+                f"[0, num_embeddings={self.num_embeddings}); a hash id past the "
+                "table can only come from a malformed EngramLayout, and masking "
+                "it to zero would be indistinguishable from a remote-shard row"
+            )
+        mask = (ids < self.vocab_start_idx) | (ids >= self.vocab_end_idx)
+        local = np.where(mask, 0, ids - self.vocab_start_idx)
+        rows = self.cache.gather_rows(local.reshape(-1), dtype=dtype)
+        rows = rows.reshape(shape + (self.dim,))
+        if bool(mask.any()):
+            rows = mx.where(mx.array(mask)[..., None], mx.zeros_like(rows), rows)
+        if self.world_size > 1:
+            if self.all_reduce is None:
+                raise RuntimeError(
+                    f"DeepseekV41EngramEmbedding is sharded over "
+                    f"{self.world_size} ranks but no all_reduce was injected. "
+                    "Each rank holds a disjoint row range and zero-masks every "
+                    "id outside it, so without the cross-rank sum this rank "
+                    "would return zeros for most lookups instead of the row. "
+                    "Pass all_reduce=..., or run at world_size == 1."
+                )
+            rows = self.all_reduce(rows)
+            if rows is None:
+                raise RuntimeError(
+                    "the injected all_reduce returned None; it must return the "
+                    "summed array (an in-place reducer should return its argument)"
+                )
+        return rows
+
+
+def engram_signed_sqrt_sigmoid_gate(
+    stream: mx.array,
+    key: mx.array,
+    weight: mx.array,
+    eps: float,
+    clamp_value: float = ENGRAM_GATE_CLAMP,
+) -> mx.array:
+    """The Engram injection gate (inference/model.py Engram.forward).
+
+    Engram does not add its lookup into the residual stream: it gates it by how
+    well the looked-up key matches the stream. Three details are load-bearing
+    and easy to get wrong:
+
+      * the RMS normalization is per (token, hc copy) over dim, **not** jointly
+        over the hc copies, and it is applied as a product of two rsqrt terms
+        rather than by normalizing either tensor;
+      * the dot product is additionally scaled by dim ** -0.5;
+      * a **signed sqrt** is taken before the sigmoid, matching the training
+        kernel, with |dot| floored at clamp_value first.
+
+    stream and key are [..., hc_mult, dim]; weight is the q_weight * k_weight
+    product, [hc_mult, dim]. Returns the [..., hc_mult] gate.
+    """
+    if stream.shape != key.shape:
+        raise ValueError(
+            f"stream shape {stream.shape} and key shape {key.shape} must match"
+        )
+    if stream.ndim < 2 or weight.shape != stream.shape[-2:]:
+        raise ValueError(
+            f"weight shape {weight.shape} must be the trailing (hc_mult, dim) of "
+            f"the stream shape {stream.shape}"
+        )
+    if clamp_value <= 0:
+        raise ValueError(f"clamp_value must be positive, got {clamp_value}")
+    dim = stream.shape[-1]
+    h = stream.astype(mx.float32)
+    k = key.astype(mx.float32)
+    w = weight.astype(mx.float32)
+    rstd = mx.rsqrt(mx.mean(h * h, axis=-1) + eps) * mx.rsqrt(
+        mx.mean(k * k, axis=-1) + eps
+    )
+    dot = mx.sum(h * w * k, axis=-1) * rstd * dim**-0.5
+    magnitude = mx.sqrt(mx.maximum(mx.abs(dot), clamp_value))
+    # copysign(magnitude, dot). dot is a real sum, so the only value whose sign
+    # this misses is a negative zero, where the clamp has already flattened the
+    # result to sigmoid(+/-sqrt(clamp_value)).
+    signed = mx.where(dot < 0, -magnitude, magnitude)
+    return mx.sigmoid(signed)
+
+
+class DeepseekV41Engram(nn.Module):
+    """Writes an n-gram lookup into the residual stream (inference/model.py Engram).
+
+    The n_hash_cols hash ids fetch that many rows; wkv turns the concatenated
+    rows into one key per hc copy plus a single shared value; the key gates the
+    value into the hc_mult-expanded stream through
+    engram_signed_sqrt_sigmoid_gate. token_mask is [B, L] and False shuts the
+    gate completely, so image-span positions pass through untouched.
+
+    The embedding is injected rather than constructed here: it is file-backed
+    and rank-specific, and nothing about this module should imply that a table
+    can be allocated.
+    """
+
+    def __init__(
+        self,
+        config: TextConfig,
+        layer_id: int,
+        layout: EngramLayout,
+        embedding: DeepseekV41EngramEmbedding,
+    ):
+        super().__init__()
+        if layer_id not in layout.layer_ids:
+            raise ValueError(
+                f"layer {layer_id} is not an Engram layer; engram_layer_ids is "
+                f"{layout.layer_ids}"
+            )
+        self.layer_id = int(layer_id)
+        self.layer_hash_index = layout.layer_ids.index(layer_id)
+        expected_rows = layout.num_embeddings[self.layer_hash_index]
+        if embedding.num_embeddings != expected_rows:
+            raise ValueError(
+                f"Engram layer {layer_id} indexes a {expected_rows}-row table but "
+                f"the injected embedding declares {embedding.num_embeddings}"
+            )
+        if embedding.dim != layout.head_dim:
+            raise ValueError(
+                f"Engram rows are {layout.head_dim} wide but the injected "
+                f"embedding serves {embedding.dim}"
+            )
+        self.dim = int(config.hidden_size)
+        self.hc_mult = int(config.hc_mult)
+        self.eps = float(config.rms_norm_eps)
+        self.clamp_value = ENGRAM_GATE_CLAMP
+        self.n_hash_cols = layout.n_hash_cols
+        self.head_dim = layout.head_dim
+        self.embed = embedding
+        self.wkv = nn.Linear(
+            self.n_hash_cols * layout.head_dim,
+            self.dim * (self.hc_mult + 1),
+            bias=False,
+        )
+        self.q_weight = mx.ones((self.hc_mult, self.dim))
+        self.k_weight = mx.ones((self.hc_mult, self.dim))
+
+    def __call__(self, x: mx.array, hash_ids, token_mask=None) -> mx.array:
+        """x: [B, L, hc_mult, dim]; hash_ids: [B, L, n_hash_cols]."""
+        if x.ndim != 4 or x.shape[-2:] != (self.hc_mult, self.dim):
+            raise ValueError(
+                f"expected a [batch, seqlen, hc_mult={self.hc_mult}, "
+                f"dim={self.dim}] stream, got shape {x.shape}"
+            )
+        ids = np.asarray(hash_ids).astype(np.int64, copy=False)
+        if ids.ndim != 3 or ids.shape[:2] != tuple(x.shape[:2]):
+            raise ValueError(
+                f"hash_ids shape {ids.shape} must be [batch, seqlen, "
+                f"n_hash_cols] matching the stream batch/seqlen {tuple(x.shape[:2])}"
+            )
+        if ids.shape[-1] != self.n_hash_cols:
+            raise ValueError(
+                f"hash_ids carries {ids.shape[-1]} columns but this layer hashes "
+                f"{self.n_hash_cols} (max_ngram_size - 1) * n_heads per token"
+            )
+        batch, seqlen = ids.shape[0], ids.shape[1]
+        rows = self.embed(ids)
+        kv = self.wkv(rows.reshape(batch, seqlen, self.n_hash_cols * self.head_dim))
+        key = kv[..., : self.hc_mult * self.dim]
+        value = kv[..., self.hc_mult * self.dim :]
+        key = key.astype(mx.float32).reshape(batch, seqlen, self.hc_mult, self.dim)
+        weight = self.q_weight.astype(mx.float32) * self.k_weight.astype(mx.float32)
+        h = x.astype(mx.float32)
+        gate = engram_signed_sqrt_sigmoid_gate(
+            h, key, weight, self.eps, self.clamp_value
+        )
+        if token_mask is not None:
+            mask = np.asarray(token_mask).astype(bool, copy=False)
+            if mask.shape != (batch, seqlen):
+                raise ValueError(
+                    f"token_mask shape {mask.shape} must be [batch, seqlen] "
+                    f"{(batch, seqlen)}"
+                )
+            gate = mx.where(mx.array(mask)[..., None], gate, mx.zeros_like(gate))
+        out = h + gate[..., None] * value.astype(mx.float32)[..., None, :]
+        return out.astype(x.dtype)
+
+
 class Model(nn.Module):
     """Registration entry point for model_type == "deepseek_v41".
 
@@ -2727,12 +4045,13 @@ class Model(nn.Module):
     (see module docstring), and sanitize applies the real, faithful wo_a
     FP8->dense-bf16 exception at load time. The base-decode attention and
     cache architecture is implemented in this module and is directly
-    usable via DeepseekV41AttentionStack, but the glue that would turn it
-    into an end-to-end model (the Block/Transformer glue joining the
-    attention stack to DeepseekV41HyperConnections and DeepseekV41MoE,
-    sparse Engram, vision/aligner, DSpark/MTP) is still out of
-    scope, so this Model still holds no layers and __call__ raises rather
-    than faking a result. Loading real checkpoint weights
+    usable via DeepseekV41AttentionStack, as are
+    DeepseekV41HyperConnections, DeepseekV41MoE and the sparse Engram path
+    (DeepseekV41Engram over a file-backed DeepseekV41EngramEmbedding). The
+    glue that would turn them into an end-to-end model (the
+    Block/Transformer glue joining them, plus vision/aligner and
+    DSpark/MTP) is still out of scope, so this Model still holds no layers
+    and __call__ raises rather than faking a result. Loading real checkpoint weights
     against this Model will fail closed (a strict tensor-name/shape
     mismatch), which is the correct, honest outcome until the deferred
     architecture lands.
@@ -2749,9 +4068,11 @@ class Model(nn.Module):
             "The base-decode attention and cache architecture IS "
             "implemented and executable: build DeepseekV41AttentionStack "
             "directly against make_deepseek_v41_attention_caches, and so "
-            "are DeepseekV41HyperConnections and DeepseekV41MoE. Still "
-            "deferred: the Block/Transformer glue that joins them, sparse "
-            "Engram row-sharded gather, vision/aligner token-budget "
+            "are DeepseekV41HyperConnections, DeepseekV41MoE and the sparse "
+            "Engram path (EngramNgramHasher -> BoundedEngramRowCache over "
+            "a SafetensorsEngramRowStore -> DeepseekV41EngramEmbedding -> "
+            "DeepseekV41Engram). Still deferred: the Block/Transformer "
+            "glue that joins them, vision/aligner token-budget "
             "arithmetic, and DSpark/MTP."
         )
 
