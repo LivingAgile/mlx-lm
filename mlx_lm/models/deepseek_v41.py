@@ -2633,10 +2633,9 @@ class DeepseekV41MoE(nn.Module):
     Routed experts are split across ranks, so only this rank's contiguous
     ``[experts_start_idx, experts_end_idx)`` block is constructed at all -- a
     rank never allocates, let alone unpacks, an expert another rank owns.
-    Combining the per-rank partial sums needs a cross-rank all-reduce, which
-    this slice deliberately does not implement: the partition is resolved and
-    inspectable, but executing at ``world_size > 1`` fails loud rather than
-    returning a silently incomplete sum.
+    Combining the per-rank partial sums uses the injected cross-rank all-reduce
+    before the replicated shared expert is added. A sharded instance without a
+    collective still fails loud rather than returning an incomplete sum.
     """
 
     def __init__(
@@ -2648,6 +2647,7 @@ class DeepseekV41MoE(nn.Module):
         shared_expert_quant: Optional[str] = "fp8",
         world_size: int = 1,
         rank: int = 0,
+        all_reduce: Optional[Callable[[mx.array], mx.array]] = None,
         vision_enabled: bool = False,
         dtype=mx.bfloat16,
     ):
@@ -2672,6 +2672,7 @@ class DeepseekV41MoE(nn.Module):
         self.topk = topk
         self.world_size = world_size
         self.rank = rank
+        self.all_reduce = all_reduce
         start, end = routed_expert_partition(n_routed, world_size, rank)
         self.experts_start_idx = start
         self.experts_end_idx = end
@@ -2714,15 +2715,10 @@ class DeepseekV41MoE(nn.Module):
     def __call__(
         self, x: mx.array, image_mask: Optional[mx.array] = None
     ) -> mx.array:
-        if self.world_size > 1:
-            raise NotImplementedError(
-                "DeepseekV41MoE executes only at world_size == 1. Each rank holds "
-                "a disjoint slice of the routed experts, so a real forward pass "
-                "needs the cross-rank all_reduce in inference/model.py "
-                "MoE.forward to sum the partial routed outputs before the shared "
-                "expert is added; that is deliberately not implemented in this "
-                "slice. The partition itself is resolved: see "
-                "routed_expert_partition and local_expert_ids."
+        if self.world_size > 1 and self.all_reduce is None:
+            raise RuntimeError(
+                "DeepseekV41MoE is sharded but has no all_reduce; rank-local "
+                "routed outputs must be summed before the shared expert is added"
             )
         if x.shape[-1] != self.dim:
             raise ValueError(
@@ -2760,6 +2756,13 @@ class DeepseekV41MoE(nn.Module):
             )
             y[tokens] = y[tokens] + out.astype(mx.float32)
 
+        if self.world_size > 1:
+            y = self.all_reduce(y)
+            if y is None:
+                raise RuntimeError(
+                    "the injected MoE all_reduce returned None; it must return "
+                    "the summed routed output"
+                )
         y = y + self.shared_experts(flat).astype(mx.float32)
         return y.astype(x.dtype).reshape(shape)
 

@@ -2274,7 +2274,31 @@ class TestDeepseekV41ExpertPartition(unittest.TestCase):
     def test_executing_a_sharded_moe_fails_loud_instead_of_silently_partial(self):
         config = _tiny_moe_text_config()
         moe = DeepseekV41MoE(config, world_size=2, rank=0)
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(RuntimeError, "no all_reduce"):
+            moe(mx.zeros((1, 2, config.hidden_size)))
+
+    def test_sharded_moe_reduces_routed_output_before_shared_expert(self):
+        config = _tiny_moe_text_config()
+        calls = []
+
+        def reducer(local):
+            calls.append(np.asarray(local))
+            return local + 3.0
+
+        moe = DeepseekV41MoE(
+            config, world_size=2, rank=0, all_reduce=reducer
+        )
+        x = mx.zeros((1, 2, config.hidden_size), dtype=mx.float32)
+        out = moe(x)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(np.allclose(np.asarray(out), 3.0))
+
+    def test_sharded_moe_rejects_an_in_place_reducer_that_returns_none(self):
+        config = _tiny_moe_text_config()
+        moe = DeepseekV41MoE(
+            config, world_size=2, rank=0, all_reduce=lambda local: None
+        )
+        with self.assertRaisesRegex(RuntimeError, "returned None"):
             moe(mx.zeros((1, 2, config.hidden_size)))
 
     def test_a_world_size_that_does_not_divide_the_experts_fails_at_construction(self):
