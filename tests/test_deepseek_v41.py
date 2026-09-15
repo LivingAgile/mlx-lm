@@ -67,7 +67,7 @@ def _text_config_dict():
         "norm_topk_prob": True,
         "routed_scaling_factor": 1.5,
         "sliding_window": 128,
-        "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
         "compress_rope_theta": 160000,
         "kv_source_layer_ids": [2, 8, 14, 20],
         "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
@@ -154,6 +154,50 @@ class TestDeepseekV41Config(unittest.TestCase):
         self.assertEqual(args.text_config.dspark_target_layer_ids, [37, 38, 39])
         self.assertEqual(args.vision_config.patch_size, 14)
         self.assertEqual(args.quantization_config.expert_dtype, "fp4")
+
+    def test_compress_ratios_matches_exact_pinned_official_43_entries(self):
+        # The full pinned official text_config.compress_ratios value
+        # (deepseek-ai/DeepSeek-V4.1-Flash@dba1be0a40aa45a94ad051997016db3960a90277
+        # config.json): 40 decode-layer entries (2 compression-disabled,
+        # 18 ratio-2, 20 ratio-1) followed by 3 trailing MTP
+        # (num_nextn_predict_layers) zeros -- 43 entries total. Asserted
+        # in full, not merely by length, so a re-truncation or a
+        # transposed/reordered value regresses loudly.
+        expected = (
+            [0, 0]
+            + [2] * 18
+            + [1] * 20
+            + [0, 0, 0]
+        )
+        self.assertEqual(len(expected), 43)
+        args = ModelArgs.from_dict(_full_config_dict())
+        self.assertEqual(args.text_config.compress_ratios, expected)
+        self.assertEqual(
+            len(args.text_config.compress_ratios),
+            args.text_config.num_hidden_layers
+            + args.text_config.num_nextn_predict_layers,
+        )
+
+    def test_compress_ratios_wrong_cardinality_fails_closed(self):
+        # A truncated (or padded) compress_ratios -- e.g. missing the
+        # trailing MTP zeros -- must fail closed at config-construction
+        # time instead of silently under/over-indexing per-layer state
+        # deep inside the (deferred) decode stack.
+        text_config = _text_config_dict()
+        text_config["compress_ratios"] = text_config["compress_ratios"][:-3]
+        self.assertEqual(len(text_config["compress_ratios"]), 40)
+        config = _full_config_dict()
+        config["text_config"] = text_config
+        with self.assertRaises(ValueError):
+            ModelArgs.from_dict(config)
+
+    def test_compress_ratios_overlong_cardinality_fails_closed(self):
+        text_config = _text_config_dict()
+        text_config["compress_ratios"] = text_config["compress_ratios"] + [0]
+        config = _full_config_dict()
+        config["text_config"] = text_config
+        with self.assertRaises(ValueError):
+            ModelArgs.from_dict(config)
 
     def test_missing_engram_field_fails_closed(self):
         text_config = _text_config_dict()
@@ -293,6 +337,51 @@ class TestDeepseekV41QuantPrimitives(unittest.TestCase):
         with self.assertRaises(ValueError):
             dequantize_fp8_block(weight, scale)
 
+    def test_fp8_block_dequant_real_partial_tail_rows(self):
+        # A genuine out-axis (row) tail block: out_dim=3 is not a multiple
+        # of block_size=2, so the scale grid is ceildiv(3, 2) == 2 blocks
+        # (one full 2-row block, one real 1-row tail block) rather than
+        # the in_dim//2 exact grid used when block_size is left implicit.
+        # Byte values and expected results were independently hand-decoded
+        # via the official E4M3FN 1-4-3 layout (bias 7, matching Probe 1's
+        # confirmed byte decode above), not asserted equal to a relabeled
+        # full block.
+        weight = mx.array(
+            [
+                [0x38, 0x40, 0x44, 0x48],  # 1.0, 2.0, 3.0, 4.0
+                [0x4A, 0x4C, 0x4E, 0x50],  # 5.0, 6.0, 7.0, 8.0
+                [0xB8, 0xC0, 0xC4, 0xC8],  # -1.0, -2.0, -3.0, -4.0 (real tail row)
+            ],
+            dtype=mx.uint8,
+        )
+        # block (0,0)->1.0 (0,1)->2.0 (1,0)->0.5 (1,1)->4.0
+        scale = mx.array([[127, 128], [126, 129]], dtype=mx.uint8)
+        decoded = dequantize_fp8_block(weight, scale, block_size=2, dtype=mx.float32)
+        self.assertEqual(decoded.shape, (3, 4))
+        expected = [
+            [1.0, 2.0, 6.0, 8.0],
+            [5.0, 6.0, 14.0, 16.0],
+            [-0.5, -1.0, -12.0, -16.0],
+        ]
+        for row_got, row_want in zip(decoded.tolist(), expected):
+            for g, w in zip(row_got, row_want):
+                self.assertAlmostEqual(g, w, places=6)
+
+    def test_fp8_block_dequant_explicit_block_size_rejects_in_axis_tail(self):
+        # The in-axis (reduction/K) is never padded: an in_dim that is not
+        # an exact multiple of block_size must fail closed even though an
+        # explicit block_size enables out-axis tail handling.
+        weight = mx.zeros((2, 3), dtype=mx.uint8)
+        scale = mx.zeros((1, 1), dtype=mx.uint8)
+        with self.assertRaises(ValueError):
+            dequantize_fp8_block(weight, scale, block_size=2)
+
+    def test_fp8_block_dequant_explicit_block_size_rejects_grid_mismatch(self):
+        weight = mx.zeros((3, 4), dtype=mx.uint8)
+        scale = mx.zeros((1, 2), dtype=mx.uint8)  # ceildiv(3, 2) == 2, not 1
+        with self.assertRaises(ValueError):
+            dequantize_fp8_block(weight, scale, block_size=2)
+
     # ---- wo_a exception -------------------------------------------- #
 
     def test_wo_a_dequant_accepts_official_block_sizes(self):
@@ -308,6 +397,17 @@ class TestDeepseekV41QuantPrimitives(unittest.TestCase):
         scale = mx.array([[127]], dtype=mx.uint8)  # implies block (16, 16)
         with self.assertRaises(ValueError):
             dequantize_wo_a(weight, scale)
+
+    def test_wo_a_dequant_accepts_real_out_axis_tail(self):
+        # wo_a's out axis (rows) may end in a genuine partial block, using
+        # the same ceildiv(out_dim, block) grid as the general FP8
+        # primitive's explicit-block_size path; the in axis must still
+        # divide the block size exactly.
+        weight = mx.zeros((40, 32), dtype=mx.uint8)
+        scale = mx.array([[127], [128]], dtype=mx.uint8)  # ceildiv(40, 32) == 2
+        out = dequantize_wo_a(weight, scale)
+        self.assertEqual(out.shape, (40, 32))
+        self.assertEqual(out.dtype, mx.bfloat16)
 
     def test_wo_a_dequant_rejects_undersized_real_byte_tile(self):
         # wo_a shares convert.py exact dequant math with the general FP8
@@ -329,6 +429,18 @@ class TestDeepseekV41QuantPrimitives(unittest.TestCase):
         model = Model(args)
         weights = {
             "layers.0.attn.wo_a.weight": mx.zeros((32, 32), dtype=mx.uint8),
+        }
+        with self.assertRaises(ValueError):
+            model.sanitize(weights)
+
+    def test_wo_a_orphan_scale_fails_closed_in_sanitize(self):
+        # Inverse of test_wo_a_missing_scale_fails_closed_in_sanitize: a
+        # wo_a.scale with no paired wo_a.weight must also fail closed, not
+        # silently pass through as an unrelated packed tensor.
+        args = ModelArgs.from_dict(_full_config_dict())
+        model = Model(args)
+        weights = {
+            "layers.0.attn.wo_a.scale": mx.array([[127]], dtype=mx.uint8),
         }
         with self.assertRaises(ValueError):
             model.sanitize(weights)
@@ -389,15 +501,34 @@ class TestDeepseekV41QuantPrimitives(unittest.TestCase):
         with self.assertRaises(ValueError):
             dequantize_fp4_block(packed, scale, block_size=32)
 
-    def test_fp4_block_dequant_odd_tail_shape(self):
-        # A 32-element block (16 bytes) that is not a multiple of two
-        # 32-blocks: exercises the odd/tail-shape handling required by the
-        # plan without needing a second full block.
-        packed = mx.zeros((1, 16), dtype=mx.uint8)
-        scale = mx.array([[127]], dtype=mx.uint8)
+    def test_fp4_block_dequant_real_partial_tail_group(self):
+        # A genuine, independently-calculated partial tail: 40 unpacked
+        # elements (20 packed bytes) with block_size=32 produces a real
+        # 8-element tail group (ceildiv(40, 32) == 2, not a second full
+        # 32-element block). Byte layout/expected values were
+        # independently hand-decoded via the official low/high nibble
+        # order and the FP4_E2M1_TABLE magnitude table.
+        block0_bytes = [0x22] * 16  # 32 elements, all code=2 -> value 1.0
+        block1_bytes = [0x21, 0x43, 0x65, 0x97]  # codes [1,2,3,4,5,6,7,9]
+        packed = mx.array(block0_bytes + block1_bytes, dtype=mx.uint8).reshape(1, 20)
+        scale = mx.array([[127, 128]], dtype=mx.uint8)  # 1.0, 2.0
+
         decoded = dequantize_fp4_block(packed, scale, block_size=32, dtype=mx.float32)
-        self.assertEqual(decoded.shape, (1, 32))
-        self.assertTrue(bool(mx.all(decoded == 0.0).item()))
+        self.assertEqual(decoded.shape, (1, 40))
+        got = decoded[0].tolist()
+        for g in got[:32]:
+            self.assertAlmostEqual(g, 1.0, places=9)
+        expected_tail = [1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, -1.0]
+        for g, w in zip(got[32:], expected_tail):
+            self.assertAlmostEqual(g, w, places=9)
+
+    def test_fp4_block_dequant_tail_grid_mismatch_fails_closed(self):
+        # A scale grid that does not match the ceil-div tail grid must
+        # still fail closed, not silently accept some other tail shape.
+        packed = mx.zeros((1, 20), dtype=mx.uint8)  # 40 unpacked elements
+        scale = mx.zeros((1, 3), dtype=mx.uint8)  # ceildiv(40, 32) == 2, not 3
+        with self.assertRaises(ValueError):
+            dequantize_fp4_block(packed, scale, block_size=32)
 
 
 if __name__ == "__main__":
