@@ -5326,10 +5326,12 @@ class Model(nn.Module):
                 blocks = self.layers if match.group(1) == "layers" else self.mtp
                 block_id = int(match.group(2))
                 expert_id = int(match.group(3))
-                if (
-                    block_id >= len(blocks)
-                    or blocks[block_id].ffn.experts[expert_id] is None
-                ):
+                if block_id >= len(blocks):
+                    raise ValueError(f"checkpoint tensor {name!r} names no model block")
+                experts = blocks[block_id].ffn.experts
+                if expert_id >= len(experts):
+                    raise ValueError(f"checkpoint tensor {name!r} names no model expert")
+                if experts[expert_id] is None:
                     excluded_by_file.setdefault(str(path), set()).add(name)
         if layout is None:
             return excluded_by_file

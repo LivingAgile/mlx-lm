@@ -4057,12 +4057,29 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             embedding = model.layers[0].engram.embed
             self.assertEqual(embedding.cache.store.row_start, 204)
             self.assertEqual(embedding.cache.store.num_rows, 204)
+            self.assertIsNotNone(embedding.all_reduce)
             self.assertTrue(
                 np.array_equal(
                     embedding.cache.store.read_rows([0])[0][0], weight[204]
                 )
             )
             embedding.cache.store.close()
+
+            def add_unknown_expert(header):
+                template = dict(header["layers.0.engram.embed.weight"])
+                header["layers.0.ffn.experts.8.w1.weight"] = dict(template)
+
+            invalid_path = Path(tmp) / "invalid.safetensors"
+            _write_engram_fixture(
+                invalid_path,
+                weight,
+                scale,
+                weight_key="layers.0.engram.embed.weight",
+                scale_key="layers.0.engram.embed.scale",
+                mutate=add_unknown_expert,
+            )
+            with self.assertRaisesRegex(ValueError, "names no model expert"):
+                model.prepare_file_backed_weights(Path(tmp), [invalid_path])
 
     def test_file_backed_loader_claims_only_the_engram_table_payloads(self):
         config = _full_config_dict()
