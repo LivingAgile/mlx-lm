@@ -1974,6 +1974,13 @@ class TestDeepseekV41PackedExperts(unittest.TestCase):
 class TestDeepseekV41MoE(unittest.TestCase):
     """384+1 MoE composition, exercised at a tiny but structurally exact size."""
 
+    # Real-MLX measurements on studio1 for the fixed tiny fixture produced
+    # max_abs=0.0234375 and max_rel=0.00003591 at output magnitude 84503.414.
+    # Grouped and one-token GEMMs may choose different reduction schedules, so
+    # preserve a mixed bound instead of requiring unsupported bitwise behavior.
+    MOE_BATCH_ATOL = 1.0 / 32.0
+    MOE_BATCH_RTOL = 5e-5
+
     def test_routed_and_shared_outputs_are_summed_per_token(self):
         config, moe = _build_tiny_moe()
         x = mx.random.normal((2, 3, config.hidden_size))
@@ -1995,7 +2002,12 @@ class TestDeepseekV41MoE(unittest.TestCase):
         expected = mx.concatenate(rows_out, axis=0)
         expected = expected + moe.shared_experts(flat).astype(mx.float32)
         self.assertTrue(
-            mx.allclose(got.reshape(-1, config.hidden_size), expected, atol=1e-3).item()
+            mx.allclose(
+                got.reshape(-1, config.hidden_size),
+                expected,
+                atol=self.MOE_BATCH_ATOL,
+                rtol=self.MOE_BATCH_RTOL,
+            ).item()
         )
 
     def test_the_shared_expert_runs_for_every_token_including_unrouted_ones(self):
@@ -2085,10 +2097,22 @@ class TestDeepseekV41MoE(unittest.TestCase):
         config, moe = _build_tiny_moe()
         x = mx.random.normal((1, 3, config.hidden_size))
         batched = moe(x)
+        _, batched_routes = moe.gate(x.reshape(-1, config.hidden_size))
         for token in range(3):
             single = moe(x[:, token : token + 1])
+            _, single_routes = moe.gate(
+                x[:, token : token + 1].reshape(-1, config.hidden_size)
+            )
             self.assertTrue(
-                mx.allclose(single[0, 0], batched[0, token], atol=1e-3).item()
+                mx.array_equal(single_routes[0], batched_routes[token]).item()
+            )
+            self.assertTrue(
+                mx.allclose(
+                    single[0, 0],
+                    batched[0, token],
+                    atol=self.MOE_BATCH_ATOL,
+                    rtol=self.MOE_BATCH_RTOL,
+                ).item()
             )
 
     def test_shape_contract_is_enforced(self):
