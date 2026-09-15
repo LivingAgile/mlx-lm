@@ -2250,13 +2250,24 @@ class TestDeepseekV41ExpertPartition(unittest.TestCase):
         moe = DeepseekV41MoE(config, world_size=4, rank=1)
         self.assertEqual(moe.local_expert_ids, [2, 3])
         self.assertEqual(moe.n_local_experts, 2)
-        self.assertEqual(len(moe.experts), 2)
+        self.assertEqual(sum(expert is not None for expert in moe.experts), 2)
         # Global ids, not rank-local ones.
-        self.assertIs(moe.expert(3), moe.experts[1])
+        self.assertIs(moe.expert(3), moe.experts[3])
         with self.assertRaises(KeyError):
             moe.expert(0)
         with self.assertRaises(KeyError):
             moe.expert(4)
+
+    def test_a_sharded_rank_preserves_global_expert_parameter_names(self):
+        config = _tiny_moe_text_config()
+        moe = DeepseekV41MoE(config, world_size=2, rank=1)
+        leaves = {name for name, _ in tree_flatten(moe.parameters())}
+        expert_ids = {
+            int(name.split(".")[1])
+            for name in leaves
+            if name.startswith("experts.")
+        }
+        self.assertEqual(expert_ids, {4, 5, 6, 7})
 
     def test_the_gate_is_replicated_across_ranks_while_experts_are_not(self):
         config = _tiny_moe_text_config()
@@ -2264,7 +2275,7 @@ class TestDeepseekV41ExpertPartition(unittest.TestCase):
             moe = DeepseekV41MoE(config, world_size=4, rank=rank)
             self.assertEqual(moe.gate.weight.shape, (8, config.hidden_size))
             self.assertEqual(moe.gate.n_routed_experts, 8)
-            self.assertEqual(len(moe.experts), 2)
+            self.assertEqual(sum(expert is not None for expert in moe.experts), 2)
             # Every rank runs the shared expert; only the routed set is split.
             self.assertEqual(
                 moe.shared_experts.w1.weight.shape,
@@ -3965,6 +3976,29 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
                 for name, _ in tree_flatten(model.parameters())
             )
         )
+
+    def test_model_shard_preserves_global_expert_names_in_every_backbone_layer(self):
+        class Group:
+            def size(self):
+                return 2
+
+            def rank(self):
+                return 1
+
+        model = Model(self._args())
+        model.shard(Group())
+
+        for layer in model.layers:
+            self.assertEqual(layer.ffn.local_expert_ids, [4, 5, 6, 7])
+            self.assertEqual(
+                sum(expert is not None for expert in layer.ffn.experts), 4
+            )
+        expert_ids = {
+            int(name.split(".")[4])
+            for name, _ in tree_flatten(model.parameters())
+            if name.startswith("layers.0.ffn.experts.")
+        }
+        self.assertEqual(expert_ids, {4, 5, 6, 7})
 
     def test_file_backed_loader_claims_only_the_engram_table_payloads(self):
         config = _full_config_dict()

@@ -48,9 +48,9 @@ architecture (Plan 0051 M2). It provides:
     (``DeepseekV41PackedLinear``) that are decoded only for the experts a
     token actually routes to, and only for the duration of that call
     (``DeepseekV41Gate``, ``DeepseekV41Expert``, ``DeepseekV41MoE``).
-    ``routed_expert_partition`` resolves the per-rank expert split; the
-    cross-rank all-reduce that would combine those partial sums is not
-    implemented, and executing at ``world_size > 1`` fails loud.
+    ``routed_expert_partition`` resolves the per-rank expert split, and
+    ``Model.shard`` retains globally numbered local experts and binds MLX's
+    cross-rank all-sum before the replicated shared expert is added.
 
   * The exact sparse Engram n-gram path, which is the one component that
     cannot be ported by allocating its weights: the two official tables are
@@ -2676,16 +2676,15 @@ class DeepseekV41MoE(nn.Module):
         start, end = routed_expert_partition(n_routed, world_size, rank)
         self.experts_start_idx = start
         self.experts_end_idx = end
-        self.experts = [
-            DeepseekV41Expert(
+        self.experts = [None] * n_routed
+        for expert_id in range(start, end):
+            self.experts[expert_id] = DeepseekV41Expert(
                 self.dim,
                 self.inter_dim,
                 expert_quant,
                 config.swiglu_limit,
                 dtype,
             )
-            for _ in range(start, end)
-        ]
         self.shared_experts = DeepseekV41Expert(
             self.dim,
             self.inter_dim,
@@ -2710,7 +2709,34 @@ class DeepseekV41MoE(nn.Module):
                 f"expert {expert_id} is not local to rank {self.rank}, which owns "
                 f"[{self.experts_start_idx}, {self.experts_end_idx})"
             )
-        return self.experts[expert_id - self.experts_start_idx]
+        return self.experts[expert_id]
+
+    def shard(self, group) -> None:
+        """Retain this rank's globally numbered experts and bind their sum."""
+        world_size = group.size()
+        rank = group.rank()
+        start, end = routed_expert_partition(
+            self.n_routed_experts, world_size, rank
+        )
+        if self.world_size != 1 and (
+            self.world_size != world_size or self.rank != rank
+        ):
+            raise ValueError(
+                f"MoE is already sharded as rank {self.rank}/{self.world_size}; "
+                f"cannot reshard it as rank {rank}/{world_size}"
+            )
+        for expert_id in range(self.n_routed_experts):
+            if not start <= expert_id < end:
+                self.experts[expert_id] = None
+        self.world_size = world_size
+        self.rank = rank
+        self.experts_start_idx = start
+        self.experts_end_idx = end
+        self.all_reduce = (
+            None
+            if world_size == 1
+            else lambda value: mx.distributed.all_sum(value, group=group)
+        )
 
     def __call__(
         self, x: mx.array, image_mask: Optional[mx.array] = None
@@ -2750,7 +2776,7 @@ class DeepseekV41MoE(nn.Module):
             # below cannot drop a contribution.
             tokens = mx.array([t for t, _ in pairs], dtype=mx.int32)
             slots = mx.array([s for _, s in pairs], dtype=mx.int32)
-            out = self.experts[expert_id - self.experts_start_idx](
+            out = self.experts[expert_id](
                 mx.take(flat, tokens, axis=0),
                 mx.take(flat_weights, slots).reshape(-1, 1),
             )
@@ -5205,6 +5231,14 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self._runtime.make_cache()
+
+    def shard(self, group=None):
+        group = group or mx.distributed.init()
+        self._sync_runtime()
+        for layer in self.layers:
+            layer.ffn.shard(group)
+        for layer in self.mtp:
+            layer.ffn.shard(group)
 
     def bind_engram(self, hasher, modules):
         self._runtime.bind_engram(hasher, modules)
