@@ -64,6 +64,7 @@ from mlx_lm.models.deepseek_v41 import (
     BoundedEngramRowCache,
     DeepseekV41AttentionStack,
     DeepseekV41Engram,
+        DeepseekV41DSpark,
     DeepseekV41EngramEmbedding,
     DeepseekV41Expert,
     DeepseekV41Gate,
@@ -95,6 +96,7 @@ from mlx_lm.models.deepseek_v41 import (
     dequantize_engram_rows,
     dequantize_fp4_block,
     dequantize_fp8_block,
+        get_dspark_topk_idxs,
     dequantize_wo_a,
     deterministic_topk_indices,
     engram_compressed_token_key,
@@ -1409,6 +1411,37 @@ def _tiny_moe_text_config(**overrides):
             "compress_ratios": [0, 0, 0, 0],
             "n_routed_experts": 8,
             "num_experts_per_tok": 3,
+        }
+    )
+    cfg.update(overrides)
+    return TextConfig.from_dict(cfg)
+
+
+def _tiny_dspark_text_config(**overrides):
+    cfg = _text_config_dict()
+    cfg.update(
+        {
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "moe_intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_nextn_predict_layers": 3,
+            "compress_ratios": [0] * 7,
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 3,
+            "dspark_block_size": 2,
+            "dspark_noise_token_id": 63,
+            "dspark_target_layer_ids": [1, 3],
+            "dspark_markov_rank": 8,
+            "dspark_n_routed_experts": 8,
+            "dspark_num_experts_per_tok": 3,
+            "num_attention_heads": 4,
+            "head_dim": 32,
+            "qk_rope_head_dim": 8,
+            "q_lora_rank": 32,
+            "o_groups": 2,
+            "o_lora_rank": 8,
+            "sliding_window": 4,
         }
     )
     cfg.update(overrides)
@@ -3543,6 +3576,41 @@ class TestDeepseekV41ImageGrid(unittest.TestCase):
         broken = _tiny_vision_config(max_image_tokens=2)
         with self.assertRaises(ValueError):
             plan_image_grid(8, 8, broken)
+
+
+class TestDeepseekV41DSpark(unittest.TestCase):
+    def test_topk_indices_join_main_window_and_draft_block(self):
+        actual = np.asarray(get_dspark_topk_idxs(4, 2, 2, 3))
+        self.assertEqual(actual.shape, (2, 2, 6))
+        self.assertTrue(np.array_equal(actual[0, 0], np.arange(6)))
+        with self.assertRaises(ValueError):
+            get_dspark_topk_idxs(4, 1, 2, 0)
+
+    def test_forward_spec_prefill_then_decode_matches_official_shapes(self):
+        config = _tiny_dspark_text_config()
+        model = DeepseekV41DSpark(config, temperature=0)
+        prefill_hidden = mx.zeros((1, 4, 64), dtype=mx.float32)
+        self.assertIsNone(
+            model.forward_spec(mx.array([7], dtype=mx.int32), prefill_hidden)
+        )
+        result = model.forward_spec(
+            mx.array([8], dtype=mx.int32),
+            mx.zeros((1, 1, 64), dtype=mx.float32),
+            start_pos=4,
+        )
+        output_ids, logits, confidence = result
+        self.assertEqual(output_ids.shape, (1, 3))
+        self.assertEqual(logits.shape, (1, 2, 64))
+        self.assertEqual(confidence.shape, (1, 2))
+        self.assertEqual(int(output_ids[0, 0]), 8)
+
+    def test_malformed_dspark_config_fails_closed(self):
+        with self.assertRaises(ValueError):
+            DeepseekV41DSpark(_tiny_dspark_text_config(compress_ratios=[0] * 6 + [1]))
+        with self.assertRaises(ValueError):
+            DeepseekV41DSpark(_tiny_dspark_text_config(dspark_target_layer_ids=[]))
+        with self.assertRaises(ValueError):
+            DeepseekV41DSpark(_tiny_dspark_text_config(dspark_noise_token_id=64))
 
 
 class TestDeepseekV41VisionMerge(unittest.TestCase):

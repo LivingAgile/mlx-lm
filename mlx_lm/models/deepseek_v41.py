@@ -2766,6 +2766,342 @@ class DeepseekV41MoE(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# DSpark / MTP isolated forward_spec path                                      #
+# --------------------------------------------------------------------------- #
+
+
+def get_dspark_topk_idxs(
+    window_size: int, batch: int, block_size: int, start_pos: int
+) -> mx.array:
+    """Indices used by the official DSpark attention over main and draft KV."""
+    if start_pos <= 0:
+        raise ValueError(f"DSpark decode requires start_pos > 0, got {start_pos}")
+    if window_size < 1 or batch < 1 or block_size < 1:
+        raise ValueError(
+            "window_size, batch and block_size must be positive, got "
+            f"{window_size}, {batch}, {block_size}"
+        )
+    main = mx.arange(min(window_size, start_pos + 1), dtype=mx.int32)
+    draft = window_size + mx.arange(block_size, dtype=mx.int32)
+    row = mx.concatenate([main, draft])
+    return mx.broadcast_to(row.reshape(1, 1, -1), (batch, block_size, row.size))
+
+
+class DeepseekV41DSparkEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, dim: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.weight = mx.zeros((vocab_size, dim), dtype=mx.bfloat16)
+
+    def __call__(self, token_ids: mx.array) -> mx.array:
+        ids = np.asarray(token_ids)
+        if ids.size and (ids.min() < 0 or ids.max() >= self.vocab_size):
+            raise ValueError(f"token id is outside [0, {self.vocab_size})")
+        return mx.take(self.weight, token_ids.astype(mx.int32), axis=0)
+
+
+class DeepseekV41DSparkHead(nn.Module):
+    def __init__(self, vocab_size: int, dim: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.weight = mx.zeros((vocab_size, dim), dtype=mx.float32)
+
+    def __call__(self, x: mx.array, full_logits: bool = False) -> mx.array:
+        if x.shape[-1] != self.dim:
+            raise ValueError(
+                f"head expected a trailing dimension of {self.dim}, got {x.shape}"
+            )
+        if not full_logits:
+            x = x[:, -1]
+        return x.astype(mx.float32) @ self.weight.T
+
+
+class DeepseekV41DSparkMarkovHead(nn.Module):
+    def __init__(self, vocab_size: int, markov_rank: int):
+        super().__init__()
+        self.embed = DeepseekV41DSparkEmbedding(vocab_size, markov_rank)
+        self.head = DeepseekV41DSparkHead(vocab_size, markov_rank)
+
+    def __call__(self, token_ids: mx.array) -> Tuple[mx.array, mx.array]:
+        embed = self.embed(token_ids)
+        return self.head(embed, full_logits=True), embed
+
+
+class DeepseekV41DSparkConfidenceHead(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.proj = DeepseekV41PackedLinear(
+            input_dim, 1, quant=None, dtype=mx.float32
+        )
+
+    def __call__(self, hidden: mx.array, markov_embed: mx.array) -> mx.array:
+        if tuple(hidden.shape[:-1]) != tuple(markov_embed.shape[:-1]):
+            raise ValueError(
+                f"hidden axes {hidden.shape[:-1]} do not match Markov axes "
+                f"{markov_embed.shape[:-1]}"
+            )
+        return self.proj(
+            mx.concatenate(
+                [hidden.astype(mx.float32), markov_embed.astype(mx.float32)], axis=-1
+            )
+        ).squeeze(-1)
+
+
+class DeepseekV41DSparkAttentionCache:
+    """One DSpark stage's main-model sliding-window KV state."""
+
+    def __init__(self, window_size: int, head_dim: int):
+        self.window_size = window_size
+        self.head_dim = head_dim
+        self.window: Optional[mx.array] = None
+        self.offset = 0
+
+    def update_main(self, kv: mx.array, start_pos: int) -> mx.array:
+        batch, seqlen, dim = kv.shape
+        if dim != self.head_dim:
+            raise ValueError(f"DSpark cache expected head_dim={self.head_dim}, got {dim}")
+        if self.window is None or self.window.shape[0] != batch:
+            if start_pos != 0:
+                raise ValueError("DSpark decode requires a preceding prefill")
+            self.window = mx.zeros(
+                (batch, self.window_size, self.head_dim), dtype=kv.dtype
+            )
+        if start_pos == 0:
+            if seqlen <= self.window_size:
+                self.window[:, :seqlen] = kv
+            else:
+                cutoff = seqlen % self.window_size
+                tail = kv[:, -self.window_size :]
+                self.window[:, cutoff:] = tail[:, : self.window_size - cutoff]
+                if cutoff:
+                    self.window[:, :cutoff] = tail[:, self.window_size - cutoff :]
+            self.offset = seqlen
+            return kv
+        if start_pos != self.offset or seqlen != 1:
+            raise ValueError(
+                f"DSpark cache expected one main token at position {self.offset}, "
+                f"got start_pos={start_pos}, seqlen={seqlen}"
+            )
+        self.window[:, start_pos % self.window_size] = kv[:, 0]
+        self.offset = start_pos + 1
+        return self.window
+
+
+class DeepseekV41DSparkAttention(DeepseekV41Attention):
+    """DSpark attention: draft queries plus main-model and draft KV."""
+
+    def __init__(self, config: TextConfig, layer_id: int):
+        if config.compress_ratios[layer_id] != 0:
+            raise ValueError(
+                f"DSpark layer {layer_id} must have compress_ratio=0, got "
+                f"{config.compress_ratios[layer_id]}"
+            )
+        policy = AttentionLayerPolicy(
+            layer_id, 0, False, False, False, False, False, None, None, None
+        )
+        super().__init__(config, policy)
+
+    def __call__(
+        self,
+        x: mx.array,
+        main_x: mx.array,
+        start_pos: int,
+        cache: DeepseekV41DSparkAttentionCache,
+    ) -> mx.array:
+        if main_x.ndim != 3 or main_x.shape[-1] != self.wkv.weight.shape[1]:
+            raise ValueError(f"malformed DSpark main hidden state {main_x.shape}")
+        main_positions = mx.arange(
+            start_pos, start_pos + main_x.shape[1], dtype=mx.int32
+        )
+        main_cos, main_sin = self.rope(main_positions)
+        main_kv = self.kv_norm(self.wkv(main_x))
+        main_kv = apply_rope_tail(
+            main_kv, main_cos, main_sin, self.rope_head_dim
+        )
+        main_kv = act_quant_roundtrip(main_kv, FP8_ACT_BLOCK_SIZE)
+        window_kv = cache.update_main(main_kv, start_pos)
+        if start_pos == 0:
+            return x
+
+        if x.ndim != 3:
+            raise ValueError(f"DSpark draft stream must be [batch, block, dim], got {x.shape}")
+        batch, block_size, _ = x.shape
+        draft_positions = mx.arange(
+            start_pos + main_x.shape[1],
+            start_pos + main_x.shape[1] + block_size,
+            dtype=mx.int32,
+        )
+        cos, sin = self.rope(draft_positions)
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).reshape(batch, block_size, self.n_heads, self.head_dim)
+        q = apply_rope_tail(q, cos, sin, self.rope_head_dim)
+        draft_kv = self.kv_norm(self.wkv(x))
+        draft_kv = apply_rope_tail(draft_kv, cos, sin, self.rope_head_dim)
+        draft_kv = act_quant_roundtrip(draft_kv, FP8_ACT_BLOCK_SIZE)
+        kv = mx.concatenate([window_kv, draft_kv], axis=1)
+        idxs = get_dspark_topk_idxs(
+            self.window_size, batch, block_size, start_pos
+        )
+        out = sparse_attn(q, kv, self.attn_sink, idxs, self.softmax_scale)
+        out = apply_rope_tail(out, cos, sin, self.rope_head_dim, inverse=True)
+        wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
+        out = mx.einsum(
+            "bsgd,grd->bsgr",
+            out.reshape(batch, block_size, self.n_groups, -1),
+            wo_a.astype(out.dtype),
+        )
+        return self.wo_b(out.reshape(batch, block_size, -1))
+
+
+def _sample_dspark(logits: mx.array, temperature: float) -> mx.array:
+    if temperature == 0:
+        return mx.argmax(logits, axis=-1).astype(mx.int32)
+    return mx.random.categorical(logits / max(temperature, 1e-5)).astype(mx.int32)
+
+
+class DeepseekV41DSparkBlock(DeepseekV41HyperConnections):
+    """One official DSpark stage stored under the ``mtp.*`` namespace."""
+
+    def __init__(self, config: TextConfig, layer_id: int, temperature: float = 1.0):
+        super().__init__(config)
+        self.layer_id = layer_id
+        self.stage_id = layer_id - config.num_hidden_layers
+        self.block_size = config.dspark_block_size
+        self.noise_token_id = config.dspark_noise_token_id
+        self.temperature = float(temperature)
+        self.attn = DeepseekV41DSparkAttention(config, layer_id)
+        self.ffn = DeepseekV41MoE(
+            config,
+            n_routed_experts=config.dspark_n_routed_experts,
+            n_activated_experts=config.dspark_num_experts_per_tok,
+        )
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.cache = DeepseekV41DSparkAttentionCache(
+            config.sliding_window, config.head_dim
+        )
+        if self.stage_id == 0:
+            self.main_proj = DeepseekV41PackedLinear(
+                config.hidden_size * len(config.dspark_target_layer_ids),
+                config.hidden_size,
+                quant="fp8",
+            )
+            self.main_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.stage_id == config.num_nextn_predict_layers - 1:
+            self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.markov_head = DeepseekV41DSparkMarkovHead(
+                config.vocab_size, config.dspark_markov_rank
+            )
+            self.confidence_head = DeepseekV41DSparkConfidenceHead(
+                config.hidden_size + config.dspark_markov_rank
+            )
+
+    def __call__(self, x, start_pos, pre_mix, main_x):
+        if start_pos == 0:
+            self.attn(x, main_x, start_pos, self.cache)
+            return x, pre_mix
+        x, attn_pre = self.sublayer_step(
+            x,
+            pre_mix,
+            lambda value: self.attn(
+                self.attn_norm(value), main_x, start_pos, self.cache
+            ),
+            "attn",
+        )
+        return self.sublayer_step(
+            x, attn_pre, lambda value: self.ffn(self.ffn_norm(value)), "ffn"
+        )
+
+    def forward_embed(self, main_hidden, input_ids, embed):
+        if self.stage_id != 0:
+            raise ValueError("forward_embed belongs to DSpark stage 0")
+        if input_ids.ndim != 1:
+            raise ValueError(f"DSpark input_ids must be [batch], got {input_ids.shape}")
+        main_x = self.main_norm(self.main_proj(main_hidden))
+        draft_ids = mx.full(
+            (input_ids.shape[0], self.block_size),
+            self.noise_token_id,
+            dtype=mx.int32,
+        )
+        draft_ids[:, 0] = input_ids.astype(mx.int32)
+        x = expand_hyper_connection_stream(embed(draft_ids), self.hc_mult)
+        return x, main_x
+
+    def forward_head(self, x, pre_mix, input_ids, head):
+        if not hasattr(self, "markov_head"):
+            raise ValueError("forward_head belongs to the final DSpark stage")
+        hidden = hc_pre(x, pre_mix)
+        logits = head(self.norm(hidden), full_logits=True)
+        output_ids = mx.zeros(
+            (input_ids.shape[0], self.block_size + 1), dtype=mx.int32
+        )
+        output_ids[:, 0] = input_ids.astype(mx.int32)
+        markov_embeds = []
+        for index in range(self.block_size):
+            logits_bias, markov_embed = self.markov_head(output_ids[:, index])
+            logits[:, index] = logits[:, index] + logits_bias
+            markov_embeds.append(markov_embed)
+            output_ids[:, index + 1] = _sample_dspark(
+                logits[:, index], self.temperature
+            )
+        markov_embed = mx.stack(markov_embeds, axis=1)
+        confidence = self.confidence_head(hidden, markov_embed)
+        return output_ids, logits, confidence
+
+
+class DeepseekV41DSpark(nn.Module):
+    """Isolated official ``forward_spec`` path; no speculative driver."""
+
+    def __init__(self, config: TextConfig, temperature: float = 1.0):
+        super().__init__()
+        if config.num_nextn_predict_layers < 1 or config.dspark_block_size < 1:
+            raise ValueError("DSpark requires positive MTP layer and block counts")
+        if len(config.dspark_target_layer_ids) < 1:
+            raise ValueError("DSpark requires at least one target backbone layer")
+        if len(set(config.dspark_target_layer_ids)) != len(config.dspark_target_layer_ids):
+            raise ValueError("DSpark target layer ids must be unique")
+        if any(
+            layer_id < 0 or layer_id >= config.num_hidden_layers
+            for layer_id in config.dspark_target_layer_ids
+        ):
+            raise ValueError("DSpark target layer id is outside the backbone")
+        mtp_ratios = config.compress_ratios[config.num_hidden_layers :]
+        if mtp_ratios != [0] * config.num_nextn_predict_layers:
+            raise ValueError(f"DSpark MTP compress ratios must all be zero, got {mtp_ratios}")
+        if not 0 <= config.dspark_noise_token_id < config.vocab_size:
+            raise ValueError("DSpark noise token id is outside the vocabulary")
+        self.config = config
+        self.hc_mult = config.hc_mult
+        self.embed = DeepseekV41DSparkEmbedding(config.vocab_size, config.hidden_size)
+        self.head = DeepseekV41DSparkHead(config.vocab_size, config.hidden_size)
+        self.mtp = [
+            DeepseekV41DSparkBlock(
+                config, config.num_hidden_layers + stage_id, temperature
+            )
+            for stage_id in range(config.num_nextn_predict_layers)
+        ]
+
+    def forward_spec(self, input_ids, main_hidden, start_pos: int = 0):
+        expected_width = self.config.hidden_size * len(
+            self.config.dspark_target_layer_ids
+        )
+        if main_hidden.ndim != 3 or main_hidden.shape[-1] != expected_width:
+            raise ValueError(
+                f"main_hidden must be [batch, seqlen, {expected_width}], got "
+                f"{main_hidden.shape}"
+            )
+        x, main_x = self.mtp[0].forward_embed(main_hidden, input_ids, self.embed)
+        pre_mix = make_identity_pre_mix(x.shape[0], x.shape[1], self.hc_mult)
+        for layer in self.mtp:
+            x, pre_mix = layer(x, start_pos, pre_mix, main_x)
+        if start_pos == 0:
+            return None
+        return self.mtp[-1].forward_head(x, pre_mix, input_ids, self.head)
+
+
+# --------------------------------------------------------------------------- #
 # Engram: sparse n-gram hash addressing                                        #
 #                                                                              #
 # Faithful to inference/engram.py (build_compressed_token_map,                 #
