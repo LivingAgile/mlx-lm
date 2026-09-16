@@ -232,6 +232,8 @@ class ModelArgs(BaseModelArgs):
     eos_token_id: int = 1
     pad_token_id: int = 2
     transformers_version: Optional[str] = None
+    quantization: Optional[Dict[str, Any]] = None
+    checkpoint_profile: Optional[Dict[str, str]] = None
 
     def __post_init__(self):
         self.text_config = TextConfig.from_dict(self.text_config)
@@ -239,6 +241,53 @@ class ModelArgs(BaseModelArgs):
         self.quantization_config = QuantizationConfig.from_dict(
             self.quantization_config
         )
+        if self.quantization is None:
+            if self.checkpoint_profile is not None:
+                raise ValueError(
+                    "checkpoint_profile is only valid for a standard MLX "
+                    "quantized DeepSeek V4.1 derivative"
+                )
+            return
+        required = {
+            "group_size": 64,
+            "bits": 8,
+            "expert_bits": 4,
+        }
+        mismatched = {
+            key: self.quantization.get(key)
+            for key, value in required.items()
+            if self.quantization.get(key) != value
+        }
+        bits = self.quantization.get("engram_bits")
+        profiles = {
+            6: (
+                "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit-engram6",
+                "a01b0033a2e61ea6920b430b8249ba5b806fbde3",
+            ),
+            4: (
+                "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit",
+                "ed2e42e7366f3a993f3499b9f3c4a7043f7828a7",
+            ),
+        }
+        if mismatched or bits not in profiles:
+            raise ValueError(
+                f"unsupported DeepSeek V4.1 derivative quantization: "
+                f"mismatched={mismatched}, engram_bits={bits!r}"
+            )
+        expected_repo, expected_revision = profiles[bits]
+        profile = self.checkpoint_profile or {}
+        if (
+            profile.get("repository") != expected_repo
+            or profile.get("revision") != expected_revision
+        ):
+            raise ValueError(
+                f"engram_bits={bits} requires checkpoint_profile repository="
+                f"{expected_repo!r}, revision={expected_revision!r}; got {profile}"
+            )
+
+    @property
+    def is_mlx_derivative(self) -> bool:
+        return self.quantization is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -2412,6 +2461,58 @@ def validate_moe_routing_config(
         )
 
 
+class DeepseekV41QuantizedLinear(nn.Module):
+    """Standard MLX affine group-quantized linear without dense initialization."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        group_size: int,
+        bits: int,
+        mode: str = "affine",
+    ):
+        super().__init__()
+        if mode != "affine":
+            raise ValueError(
+                f"DeepSeek V4.1 derivatives require affine quantization, got {mode!r}"
+            )
+        if bits not in (4, 6, 8):
+            raise ValueError(f"quantization bits must be 4, 6, or 8, got {bits}")
+        if group_size < 1 or in_features % group_size:
+            raise ValueError(
+                f"in_features={in_features} must divide group_size={group_size}"
+            )
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.group_size = int(group_size)
+        self.bits = int(bits)
+        self.mode = mode
+        self.weight = mx.zeros(
+            (out_features, in_features * bits // 32), dtype=mx.uint32
+        )
+        self.scales = mx.zeros(
+            (out_features, in_features // group_size), dtype=mx.bfloat16
+        )
+        self.biases = mx.zeros_like(self.scales)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"expected a trailing dimension of {self.in_features}, got {x.shape}"
+            )
+        return mx.quantized_matmul(
+            x,
+            self.weight,
+            scales=self.scales,
+            biases=self.biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+
+
 class DeepseekV41PackedLinear(nn.Module):
     """A bias-free Linear whose weight stays packed at rest.
 
@@ -2482,6 +2583,18 @@ class DeepseekV41PackedLinear(nn.Module):
         # Immediate public leaves so dict(module) inspects packed state, not
         # a transient decode. mlx.nn.Module is not a mapping on every runtime.
         return iter(self.parameters().items())
+
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4, mode: str = "affine"
+    ) -> DeepseekV41QuantizedLinear:
+        """Replace the official packed module for a standard MLX derivative load."""
+        return DeepseekV41QuantizedLinear(
+            self.in_features,
+            self.out_features,
+            group_size,
+            bits,
+            mode,
+        )
 
     def dequantized(self) -> mx.array:
         """Decode the packed weight to a dense float32 tensor.
@@ -4377,6 +4490,7 @@ class DeepseekV41EngramEmbedding(nn.Module):
         world_size: int = 1,
         all_reduce: Optional[Callable[[mx.array], mx.array]] = None,
         block_size: int = ENGRAM_FP8_BLOCK_SIZE,
+        gather_chunk_size: Optional[int] = None,
     ):
         super().__init__()
         if num_embeddings < 1:
@@ -4408,6 +4522,13 @@ class DeepseekV41EngramEmbedding(nn.Module):
         self.block_size = int(block_size)
         self.rank = int(rank)
         self.world_size = int(world_size)
+        self.gather_chunk_size = (
+            cache.max_rows if gather_chunk_size is None else int(gather_chunk_size)
+        )
+        if self.gather_chunk_size < 1:
+            raise ValueError(
+                f"gather_chunk_size must be positive, got {self.gather_chunk_size}"
+            )
         self.part_num_embeddings = -(-self.num_embeddings // self.world_size)
         self.vocab_start_idx = self.rank * self.part_num_embeddings
         self.vocab_end_idx = self.vocab_start_idx + self.part_num_embeddings
@@ -4442,7 +4563,14 @@ class DeepseekV41EngramEmbedding(nn.Module):
             )
         mask = (ids < self.vocab_start_idx) | (ids >= self.vocab_end_idx)
         local = np.where(mask, 0, ids - self.vocab_start_idx)
-        rows = self.cache.gather_rows(local.reshape(-1), dtype=dtype)
+        flat = local.reshape(-1)
+        chunks = [
+            self.cache.gather_rows(
+                flat[start : start + self.gather_chunk_size], dtype=dtype
+            )
+            for start in range(0, flat.size, self.gather_chunk_size)
+        ]
+        rows = chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=0)
         rows = rows.reshape(shape + (self.dim,))
         if bool(mask.any()):
             rows = mx.where(mx.array(mask)[..., None], mx.zeros_like(rows), rows)
@@ -5254,10 +5382,16 @@ class DeepseekV41Transformer(nn.Module):
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.head = DeepseekV41DSparkHead(config.vocab_size, config.hidden_size)
-        self.mtp = [
-            DeepseekV41DSparkBlock(config, config.num_hidden_layers + stage_id)
-            for stage_id in range(config.num_nextn_predict_layers)
-        ]
+        self.mtp = (
+            []
+            if args.is_mlx_derivative
+            else [
+                DeepseekV41DSparkBlock(
+                    config, config.num_hidden_layers + stage_id
+                )
+                for stage_id in range(config.num_nextn_predict_layers)
+            ]
+        )
         if vision_on:
             vision_runtime = DeepseekV41Vision(args.vision_config, config.hidden_size)
             self.vision = vision_runtime.vision
@@ -5517,27 +5651,48 @@ class Model(nn.Module):
         if layout is None:
             return excluded_by_file
         modules = {}
+        derivative_bits = (
+            self.args.quantization["engram_bits"]
+            if self.args.is_mlx_derivative
+            else None
+        )
         for layer_id, num_embeddings in zip(
             layout.layer_ids, layout.num_embeddings
         ):
             prefix = f"layers.{layer_id}.engram.embed"
-            weight_key, scale_key = f"{prefix}.weight", f"{prefix}.scale"
-            missing = [key for key in (weight_key, scale_key) if key not in tensor_files]
+            weight_key = f"{prefix}.weight"
+            scale_key = f"{prefix}.scales" if derivative_bits else f"{prefix}.scale"
+            bias_key = f"{prefix}.biases" if derivative_bits else None
+            owned_keys = tuple(
+                key for key in (weight_key, scale_key, bias_key) if key is not None
+            )
+            missing = [key for key in owned_keys if key not in tensor_files]
             if missing:
                 raise ValueError(
                     f"checkpoint is missing file-backed Engram tensors {missing}"
                 )
             path = tensor_files[weight_key]
-            if tensor_files[scale_key] != path:
+            if any(tensor_files[key] != path for key in owned_keys[1:]):
                 raise ValueError(
-                    f"{weight_key} and {scale_key} must share one safetensors file"
+                    f"file-backed Engram tensors {owned_keys} must share one "
+                    "safetensors file"
                 )
-            store = SafetensorsEngramRowStore(
-                str(path),
-                weight_key=weight_key,
-                scale_key=scale_key,
-                row_start=rank * (-(-num_embeddings // world_size)),
-                num_rows=-(-num_embeddings // world_size),
+            store_args = {
+                "path": str(path),
+                "weight_key": weight_key,
+                "scale_key": scale_key,
+                "row_start": rank * (-(-num_embeddings // world_size)),
+                "num_rows": -(-num_embeddings // world_size),
+            }
+            store = (
+                SafetensorsQuantizedEngramRowStore(
+                    **store_args,
+                    bias_key=bias_key,
+                    group_size=self.args.quantization["group_size"],
+                    bits=derivative_bits,
+                )
+                if derivative_bits
+                else SafetensorsEngramRowStore(**store_args)
             )
             if store.full_num_rows != num_embeddings or store.dim != layout.head_dim:
                 store.close()
@@ -5562,7 +5717,7 @@ class Model(nn.Module):
                 self.args.text_config, layer_id, layout, embedding
             )
             excluded_by_file.setdefault(str(path), set()).update(
-                (weight_key, scale_key)
+                owned_keys
             )
         self._runtime.bind_engram_modules(modules)
         self._sync_runtime()
@@ -5576,6 +5731,8 @@ class Model(nn.Module):
         dequantize_wo_a if the weight is not evenly tiled by one of the
         official square 32/128 block sizes on both axes.
         """
+        if self.args.is_mlx_derivative:
+            return weights
         weights = dict(weights)
         wo_a_weight_keys = [k for k in weights if k.endswith("wo_a.weight")]
         wo_a_scale_keys = [k for k in weights if k.endswith("wo_a.scale")]

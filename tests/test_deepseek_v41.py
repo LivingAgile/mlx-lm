@@ -73,6 +73,7 @@ from mlx_lm.models.deepseek_v41 import (
     DeepseekV41HyperConnections,
     DeepseekV41MoE,
     DeepseekV41PackedLinear,
+    DeepseekV41QuantizedLinear,
     DeepseekV41Vision,
     IMAGE,
     IMAGE_END,
@@ -2019,6 +2020,36 @@ class TestDeepseekV41PackedExperts(unittest.TestCase):
         self.assertNotIn("_dequantized", dict(lin))
         self.assertNotIn("_dequantized", after)
 
+    def test_standard_mlx_four_and_eight_bit_modules_use_checkpoint_leaves(self):
+        rng = np.random.default_rng(37)
+        dense = mx.array(rng.normal(size=(32, 64)).astype(np.float32))
+        inputs = mx.array(rng.normal(size=(3, 64)).astype(np.float32))
+        for bits in (4, 8):
+            weight, scales, biases = mx.quantize(
+                dense, group_size=64, bits=bits
+            )
+            source = DeepseekV41PackedLinear(
+                64, 32, "fp4" if bits == 4 else "fp8"
+            )
+            linear = source.to_quantized(group_size=64, bits=bits)
+            self.assertIsInstance(linear, DeepseekV41QuantizedLinear)
+            linear.weight = weight
+            linear.scales = scales
+            linear.biases = biases
+            expected = mx.quantized_matmul(
+                inputs,
+                weight,
+                scales=scales,
+                biases=biases,
+                transpose=True,
+                group_size=64,
+                bits=bits,
+            )
+            self.assertTrue(mx.allclose(linear(inputs), expected))
+            self.assertEqual(
+                set(dict(linear.parameters())), {"weight", "scales", "biases"}
+            )
+
     def test_packed_shape_contracts_fail_closed(self):
         for args in (
             (33, 32, "fp4"),  # reduction dim not a multiple of the FP4 block
@@ -2537,11 +2568,13 @@ def _write_engram_fixture(
     return path
 
 
-def _write_quantized_engram_fixture(path, weight, scales, biases):
+def _write_quantized_engram_fixture(
+    path, weight, scales, biases, prefix=""
+):
     arrays = (
-        ("weight", np.ascontiguousarray(weight, dtype="<u4"), "U32"),
-        ("scales", np.ascontiguousarray(scales, dtype="<u2"), "BF16"),
-        ("biases", np.ascontiguousarray(biases, dtype="<u2"), "BF16"),
+        (f"{prefix}weight", np.ascontiguousarray(weight, dtype="<u4"), "U32"),
+        (f"{prefix}scales", np.ascontiguousarray(scales, dtype="<u2"), "BF16"),
+        (f"{prefix}biases", np.ascontiguousarray(biases, dtype="<u2"), "BF16"),
     )
     header = {}
     offset = 0
@@ -3135,6 +3168,106 @@ class TestDeepseekV41QuantizedEngramRowStore(unittest.TestCase):
                 SafetensorsQuantizedEngramRowStore(path, bits=6)
 
 
+class TestDeepseekV41DerivativeProfile(unittest.TestCase):
+    def _config(self, bits=6):
+        config = _full_config_dict()
+        repo, revision = {
+            6: (
+                "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit-engram6",
+                "a01b0033a2e61ea6920b430b8249ba5b806fbde3",
+            ),
+            4: (
+                "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit",
+                "ed2e42e7366f3a993f3499b9f3c4a7043f7828a7",
+            ),
+        }[bits]
+        config["quantization"] = {
+            "group_size": 64,
+            "bits": 8,
+            "expert_bits": 4,
+            "engram_bits": bits,
+            "modules": {},
+        }
+        config["checkpoint_profile"] = {
+            "repository": repo,
+            "revision": revision,
+        }
+        return config
+
+    def test_exact_profile_omits_unpublished_mtp_and_preserves_vision(self):
+        model = Model(ModelArgs.from_dict(self._config()))
+        self.assertEqual(model.mtp, [])
+        self.assertTrue(hasattr(model, "vision"))
+        self.assertTrue(hasattr(model, "aligner"))
+
+    def test_revision_or_quantization_mismatch_fails_closed(self):
+        for mutate in (
+            lambda config: config["checkpoint_profile"].update(
+                revision="wrong"
+            ),
+            lambda config: config["quantization"].update(group_size=32),
+            lambda config: config["quantization"].update(engram_bits=5),
+        ):
+            config = self._config()
+            mutate(config)
+            with self.assertRaises(ValueError):
+                ModelArgs.from_dict(config)
+
+    def test_official_profile_keeps_mtp_and_rejects_derivative_identity(self):
+        official = _full_config_dict()
+        model = Model(ModelArgs.from_dict(official))
+        self.assertEqual(len(model.mtp), 3)
+        official["checkpoint_profile"] = self._config()["checkpoint_profile"]
+        with self.assertRaises(ValueError):
+            ModelArgs.from_dict(official)
+
+    def test_derivative_engram_loader_claims_all_three_quantized_leaves(self):
+        config = self._config()
+        text = config["text_config"] | {
+            "engram_layer_ids": [0],
+            "engram_num_embeddings": [408],
+            "engram_max_ngram_size": 3,
+            "engram_vocab_size": 97,
+            "engram_n_heads": 2,
+            "engram_head_dim": 256,
+            "engram_pad_token_id": 2,
+            "engram_compressed_vocab_size": 11,
+        }
+        config["text_config"] = text
+        model = Model(ModelArgs.from_dict(config))
+        dense = mx.zeros((408, 256), dtype=mx.float32)
+        weight, scales, biases = mx.quantize(dense, group_size=64, bits=6)
+        prefix = "layers.0.engram.embed."
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model-layers-00-engram.safetensors"
+            _write_quantized_engram_fixture(
+                path,
+                np.asarray(weight),
+                np.asarray(scales).view(np.uint16),
+                np.asarray(biases).view(np.uint16),
+                prefix=prefix,
+            )
+            excluded = model.prepare_file_backed_weights(Path(tmp), [path])
+            self.assertEqual(
+                excluded[str(path.resolve())],
+                {prefix + "weight", prefix + "scales", prefix + "biases"},
+            )
+            store = model.layers[0].engram.embed.cache.store
+            self.assertIsInstance(store, SafetensorsQuantizedEngramRowStore)
+            self.assertEqual((store.bits, store.group_size), (6, 64))
+            self.assertEqual(store.bytes_read, 0)
+            store.close()
+
+    def test_derivative_sanitize_does_not_apply_official_wo_a_rules(self):
+        model = Model(ModelArgs.from_dict(self._config()))
+        weights = {
+            "layers.0.attn.wo_a.weight": mx.zeros((2, 2), dtype=mx.uint32),
+            "layers.0.attn.wo_a.scales": mx.ones((2, 1)),
+            "layers.0.attn.wo_a.biases": mx.zeros((2, 1)),
+        }
+        self.assertEqual(model.sanitize(weights), weights)
+
+
 class TestDeepseekV41EngramRowCache(unittest.TestCase):
     """BoundedEngramRowCache: dedup on the way in, a hard ceiling on residency."""
 
@@ -3463,6 +3596,21 @@ class TestDeepseekV41EngramEmbedding(unittest.TestCase):
         embedding(np.arange(64, dtype=np.int64))
         self.assertEqual(embedding.nbytes(), 4 * 33)
         self.assertLess(embedding.nbytes(), embedding.num_embeddings * 33)
+
+    def test_long_gathers_bound_each_transient_chunk(self):
+        embedding = self._embedding(0, 64, max_rows=4)
+        seen = []
+        original = embedding.cache.gather_rows
+
+        def measured(row_ids, dtype=mx.bfloat16):
+            seen.append(len(row_ids))
+            return original(row_ids, dtype)
+
+        embedding.cache.gather_rows = measured
+        rows = embedding(np.arange(19, dtype=np.int64))
+        self.assertEqual(rows.shape, (19, 32))
+        self.assertEqual(seen, [4, 4, 4, 4, 3])
+        self.assertLessEqual(embedding.cache.resident_rows, 4)
 
     def test_an_empty_lookup_is_well_shaped(self):
         embedding = self._embedding(0, 64)
