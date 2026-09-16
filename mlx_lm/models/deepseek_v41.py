@@ -91,7 +91,7 @@ import json
 import math
 import re
 import unicodedata
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -1415,12 +1415,51 @@ class DeepseekV41AttentionCache(_BaseCache):
             if policy.is_kv_source and policy.compress_ratio > 1
             else None
         )
+        self._rollback = deque(maxlen=2)
 
     def size(self) -> int:
         return self.offset
 
     def empty(self) -> bool:
         return self.offset == 0
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def begin_update(self) -> None:
+        self._rollback.append(
+            (
+                self.offset,
+                None if self.window is None else mx.array(self.window),
+                None if self.pool_state is None or self.pool_state.kv is None else mx.array(self.pool_state.kv),
+                None if self.pool_state is None or self.pool_state.score is None else mx.array(self.pool_state.score),
+                None if self.compress_kv_writer is None else self.compress_kv_writer.length,
+                None if self.index_key_writer is None else self.index_key_writer.length,
+            )
+        )
+
+    def trim(self, n: int) -> int:
+        n = min(self.offset, n)
+        target = self.offset - n
+        snapshot = next((entry for entry in self._rollback if entry[0] == target), None)
+        if snapshot is None:
+            raise ValueError(
+                f"deepseek_v41 cache can only trim the last two single-token updates; "
+                f"cannot roll layer {self.layer_id} back from {self.offset} to {target}"
+            )
+        _, window, pool_kv, pool_score, compress_len, index_len = snapshot
+        self.offset = target
+        self.window = window
+        if self.pool_state is not None:
+            self.pool_state.kv = pool_kv
+            self.pool_state.score = pool_score
+        if self.compress_kv_writer is not None:
+            self.compress_kv_writer.length = compress_len
+        if self.index_key_writer is not None:
+            self.index_key_writer.length = index_len
+        while self._rollback and self._rollback[-1][0] >= target:
+            self._rollback.pop()
+        return n
 
     @property
     def nbytes(self) -> int:
@@ -1854,6 +1893,7 @@ class DeepseekV41Attention(nn.Module):
             )
         batch, seqlen, _ = x.shape
         start_pos = cache.offset
+        cache.begin_update()
         cache.enter(start_pos, seqlen)
         cos, sin = self.rope(
             mx.arange(start_pos, start_pos + seqlen, dtype=mx.int32)
