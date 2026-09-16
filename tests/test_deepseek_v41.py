@@ -3937,6 +3937,9 @@ class TestDeepseekV41PublicNames(unittest.TestCase):
             "mtp.0.attn.wkv.scale",
             "mtp.0.attn.wo_b.scale",
             "mtp.0.main_proj.scale",
+            "mtp.0.ffn.gate.bias_vl",
+            "mtp.1.ffn.gate.bias_vl",
+            "mtp.2.ffn.gate.bias_vl",
         ):
             self.assertIn(name, names)
 

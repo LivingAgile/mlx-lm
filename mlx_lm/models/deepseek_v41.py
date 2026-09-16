@@ -2996,7 +2996,13 @@ def _sample_dspark(logits: mx.array, temperature: float) -> mx.array:
 class DeepseekV41DSparkBlock(DeepseekV41HyperConnections):
     """One official DSpark stage stored under the ``mtp.*`` namespace."""
 
-    def __init__(self, config: TextConfig, layer_id: int, temperature: float = 1.0):
+    def __init__(
+        self,
+        config: TextConfig,
+        layer_id: int,
+        temperature: float = 1.0,
+        vision_enabled: bool = False,
+    ):
         super().__init__(config)
         self.layer_id = layer_id
         self.stage_id = layer_id - config.num_hidden_layers
@@ -3008,6 +3014,7 @@ class DeepseekV41DSparkBlock(DeepseekV41HyperConnections):
             config,
             n_routed_experts=config.dspark_n_routed_experts,
             n_activated_experts=config.dspark_num_experts_per_tok,
+            vision_enabled=vision_enabled,
         )
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3086,7 +3093,12 @@ class DeepseekV41DSparkBlock(DeepseekV41HyperConnections):
 class DeepseekV41DSpark(nn.Module):
     """Isolated official ``forward_spec`` path; no speculative driver."""
 
-    def __init__(self, config: TextConfig, temperature: float = 1.0):
+    def __init__(
+        self,
+        config: TextConfig,
+        temperature: float = 1.0,
+        vision_enabled: bool = False,
+    ):
         super().__init__()
         if config.num_nextn_predict_layers < 1 or config.dspark_block_size < 1:
             raise ValueError("DSpark requires positive MTP layer and block counts")
@@ -3110,7 +3122,10 @@ class DeepseekV41DSpark(nn.Module):
         self.head = DeepseekV41DSparkHead(config.vocab_size, config.hidden_size)
         self.mtp = [
             DeepseekV41DSparkBlock(
-                config, config.num_hidden_layers + stage_id, temperature
+                config,
+                config.num_hidden_layers + stage_id,
+                temperature,
+                vision_enabled,
             )
             for stage_id in range(config.num_nextn_predict_layers)
         ]
@@ -5077,7 +5092,11 @@ class DeepseekV41Transformer(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.head = DeepseekV41DSparkHead(config.vocab_size, config.hidden_size)
         self.mtp = [
-            DeepseekV41DSparkBlock(config, config.num_hidden_layers + stage_id)
+            DeepseekV41DSparkBlock(
+                config,
+                config.num_hidden_layers + stage_id,
+                vision_enabled=vision_on,
+            )
             for stage_id in range(config.num_nextn_predict_layers)
         ]
         if vision_on:
