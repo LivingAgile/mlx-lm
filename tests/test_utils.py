@@ -282,6 +282,95 @@ class TestUtils(unittest.TestCase):
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
+    def test_load_model_honors_nested_mixed_bit_quantization_policy(self):
+        from mlx_lm.models.deepseek_v41 import (
+            DeepseekV41PackedLinear,
+            DeepseekV41QuantizedLinear,
+        )
+
+        class _Args:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class _Expert(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w1 = DeepseekV41PackedLinear(64, 32, "fp4")
+
+        class _FFN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.experts = [_Expert()]
+
+        class _Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.wq_a = DeepseekV41PackedLinear(64, 32, "fp8")
+
+        class _Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ffn = _FFN()
+                self.attn = _Attention()
+
+        class _Model(nn.Module):
+            def __init__(self, args):
+                super().__init__()
+                self.layers = [_Layer()]
+
+        expert = mx.random.normal((32, 64))
+        dense = mx.random.normal((32, 64))
+        expert_weight, expert_scales, expert_biases = mx.quantize(
+            expert, group_size=64, bits=4
+        )
+        dense_weight, dense_scales, dense_biases = mx.quantize(
+            dense, group_size=64, bits=8
+        )
+        weights = {
+            "layers.0.ffn.experts.0.w1.weight": expert_weight,
+            "layers.0.ffn.experts.0.w1.scales": expert_scales,
+            "layers.0.ffn.experts.0.w1.biases": expert_biases,
+            "layers.0.attn.wq_a.weight": dense_weight,
+            "layers.0.attn.wq_a.scales": dense_scales,
+            "layers.0.attn.wq_a.biases": dense_biases,
+        }
+        config = {
+            "model_type": "test",
+            "quantization": {
+                "group_size": 64,
+                "bits": 8,
+                "expert_bits": 4,
+                "modules": {
+                    "layers.0.ffn.experts.gate_proj": {
+                        "group_size": 64,
+                        "bits": 4,
+                    },
+                    "layers.0.attn.wq_a": {"group_size": 64, "bits": 8},
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as model_path:
+            mx.save_safetensors(
+                str(Path(model_path) / "model-00001-of-00001.safetensors"),
+                weights,
+            )
+            with open(Path(model_path) / "config.json", "w") as handle:
+                json.dump(config, handle)
+
+            model, _ = utils.load_model(
+                Path(model_path),
+                get_model_classes=lambda config: (_Model, _Args),
+            )
+
+        routed = model.layers[0].ffn.experts[0].w1
+        dense = model.layers[0].attn.wq_a
+        self.assertIsInstance(routed, DeepseekV41QuantizedLinear)
+        self.assertIsInstance(dense, DeepseekV41QuantizedLinear)
+        self.assertEqual(routed.bits, 4)
+        self.assertEqual(dense.bits, 8)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -449,13 +449,42 @@ def load_model(
         weights = model.sanitize(weights)
 
     def _quantize(quantization):
+        module_quantizations = quantization.get("modules", {})
+
         def class_predicate(p, m):
             # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
+            if p in module_quantizations:
+                return module_quantizations[p]
+            parts = p.split(".")
+            expert_projection_names = {
+                "w1": "gate_proj",
+                "w2": "down_proj",
+                "w3": "up_proj",
+            }
+            if (
+                len(parts) >= 3
+                and parts[-2].isdigit()
+                and parts[-3] == "experts"
+                and parts[-1] in expert_projection_names
+            ):
+                checkpoint_path = ".".join(
+                    parts[:-2] + [expert_projection_names[parts[-1]]]
+                )
+                if checkpoint_path in module_quantizations:
+                    return module_quantizations[checkpoint_path]
+            if p in quantization and isinstance(quantization[p], dict):
+                return quantization[p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            if ".ffn.experts." in p and "expert_bits" in quantization:
+                return {
+                    "group_size": quantization["group_size"],
+                    "bits": quantization["expert_bits"],
+                    "mode": quantization.get("mode", "affine"),
+                }
+            return True
 
         nn.quantize(
             model,
