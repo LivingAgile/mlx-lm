@@ -159,6 +159,17 @@ def _diagnostic_token_cosines(
     }
 
 
+def _diagnostic_previous_token_cosine(
+    value: mx.array, previous: Optional[np.ndarray]
+) -> Tuple[Optional[float], np.ndarray]:
+    current = np.asarray(value[-1].astype(mx.float32)).reshape(-1)
+    if previous is None:
+        return None, current.copy()
+    denominator = np.linalg.norm(current) * np.linalg.norm(previous)
+    cosine = 0.0 if denominator == 0 else float(np.dot(current, previous) / denominator)
+    return cosine, current.copy()
+
+
 @dataclass
 class VisionConfig(BaseModelArgs):
     model_type: str
@@ -2801,6 +2812,7 @@ class DeepseekV41MoE(nn.Module):
         self.all_reduce = all_reduce
         self.layer_id = -1
         self._diagnostic_calls = 0
+        self._diagnostic_previous_input: Optional[np.ndarray] = None
         start, end = routed_expert_partition(n_routed, world_size, rank)
         self.experts_start_idx = start
         self.experts_end_idx = end
@@ -2912,11 +2924,16 @@ class DeepseekV41MoE(nn.Module):
 
         trace = (
             os.environ.get(_DIAGNOSTIC_ENV) == "1"
-            and self._diagnostic_calls < 2
+            and self._diagnostic_calls < 17
         )
         if trace:
             input_norm = _diagnostic_norm(flat)
             input_cosines = _diagnostic_token_cosines(flat)
+            previous_token_cosine, self._diagnostic_previous_input = (
+                _diagnostic_previous_token_cosine(
+                    flat, self._diagnostic_previous_input
+                )
+            )
             local_y_norm = _diagnostic_norm(y)
         if self.world_size > 1:
             y = self.all_reduce(y)
@@ -2941,8 +2958,10 @@ class DeepseekV41MoE(nn.Module):
                 ),
                 expert_start=self.experts_start_idx,
                 expert_end=self.experts_end_idx,
+                call=self._diagnostic_calls,
                 input_norm=input_norm,
                 **input_cosines,
+                previous_token_cosine=previous_token_cosine,
                 local_routed_norm=local_y_norm,
                 reduced_routed_norm=_diagnostic_norm(y),
                 shared_norm=_diagnostic_norm(shared),
