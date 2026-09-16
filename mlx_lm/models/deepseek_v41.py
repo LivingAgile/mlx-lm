@@ -5393,6 +5393,8 @@ class DeepseekV41Transformer(nn.Module):
         hidden = hc_pre(hidden, pre_mix)
         normalized_hidden = self.norm(hidden)
         logits = self.head(normalized_hidden, full_logits=True)
+        if os.environ.get(_DIAGNOSTIC_ENV) == "1" and start_pos == 0:
+            self._diagnostic_calls = 0
         if (
             os.environ.get(_DIAGNOSTIC_ENV) == "1"
             and self._diagnostic_calls < 17

@@ -4327,6 +4327,7 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
         try:
             with redirect_stderr(trace):
                 model(mx.array([[1, 2, 3]], dtype=mx.int32))
+                model(mx.array([[1, 2, 3]], dtype=mx.int32))
         finally:
             if prior is None:
                 os.environ.pop("MLX_LM_DEEPSEEK_V41_TRACE", None)
@@ -4338,9 +4339,10 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             for line in trace.getvalue().splitlines()
             if '"event": "model_output"' in line
         ]
-        self.assertEqual(len(events), 1)
+        self.assertEqual(len(events), 2)
         event = events[0]
         self.assertEqual(event["call"], 0)
+        self.assertEqual(events[1]["call"], 0)
         self.assertEqual(event["start_pos"], 0)
         self.assertEqual(event["input_shape"], [1, 3])
         self.assertEqual(event["input_tail"], [1, 2, 3])
