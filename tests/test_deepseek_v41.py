@@ -55,7 +55,7 @@ import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_flatten
 
-from mlx_lm.generate import _merge_caches
+from mlx_lm.generate import BatchGenerator, _merge_caches, generate_step
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.deepseek_v41 import (
     COMPRESS_KV_FP4_BLOCK_SIZE,
@@ -2656,6 +2656,12 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
         self.assertEqual(normalize_engram_token_text("cafe\u0301"), "cafe")
         self.assertEqual(normalize_engram_token_text("\u00c9\u00c0"), "ea")
 
+    def test_spacing_combining_marks_follow_the_official_rust_normalizer(self):
+        # tokenizers.StripAccents removes Bengali vowel signs (category Mc),
+        # not only category Mn marks handled by Python's common approximation.
+        self.assertEqual(normalize_engram_token_text("\u09be\u09b0"), "\u09b0")
+        self.assertEqual(normalize_engram_token_text("\u09c7\u09a8"), "\u09a8")
+
     def test_compatibility_forms_are_folded(self):
         self.assertEqual(normalize_engram_token_text("\uff21\uff22"), "ab")
 
@@ -4217,7 +4223,7 @@ class TestDeepseekV41PublicNames(unittest.TestCase):
 
 
 class TestDeepseekV41ModelComposition(unittest.TestCase):
-    def _args(self):
+    def _args(self, with_compressed_cache=False):
         config = _full_config_dict()
         text = _text_config_dict()
         text.update(
@@ -4246,6 +4252,21 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
                 "dspark_target_layer_ids": [],
             }
         )
+        if with_compressed_cache:
+            text.update(
+                {
+                    "num_hidden_layers": 8,
+                    "compress_ratios": [0, 0, 2, 2, 1, 1, 1, 1],
+                    "kv_source_layer_ids": [2, 4],
+                    "index_source_layer_ids": [2, 4, 6],
+                    "index_n_heads": 2,
+                    "index_head_dim": 32,
+                    "index_topk": 4,
+                    "candidate_source_layer_id": 4,
+                    "candidate_topk_blocks": 2,
+                    "candidate_block_size": 2,
+                }
+            )
         config["text_config"] = text
         config["vision_config"] = _vision_config_dict() | {"num_hidden_layers": 0}
         return ModelArgs.from_dict(config)
@@ -4272,6 +4293,45 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
                 for name, _ in tree_flatten(model.parameters())
             )
         )
+
+    def test_exo_prefill_rollback_and_tail_replay_matches_clean_decode(self):
+        model = Model(self._args(with_compressed_cache=True))
+        model.embed.weight = mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
+        model.head.weight = mx.eye(64, 32, dtype=mx.float32)
+        prompt = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+
+        replay_cache = model.make_cache()
+        generation = generate_step(
+            prompt[0, :-1],
+            model,
+            max_tokens=1,
+            prompt_cache=replay_cache,
+            prefill_step_size=4096,
+        )
+        next(generation)
+        mx.eval([layer_cache.state for layer_cache in replay_cache])
+        for layer_cache in replay_cache:
+            self.assertEqual(layer_cache.trim(2), 2)
+
+        batch_generation = BatchGenerator(model, stop_tokens=[], prefill_step_size=4096)
+        batch_generation.insert(
+            prompts=[prompt[0, -2:].tolist()],
+            max_tokens=[8],
+            caches=[replay_cache],
+        )
+        full_tokens = prompt[0].tolist()
+        for step in range(8):
+            responses = batch_generation.next_generated()
+            self.assertEqual(len(responses), 1)
+            response = responses[0]
+            clean_logits = model(mx.array([full_tokens], dtype=mx.int32))[:, -1, :]
+            clean_logprobs = clean_logits - mx.logsumexp(clean_logits, keepdims=True)
+            mx.eval(clean_logprobs, response.logprobs)
+            self.assertTrue(
+                mx.allclose(response.logprobs, clean_logprobs[0], atol=1e-4, rtol=1e-4),
+                f"EXO cache diverged from full-sequence logits at decode step {step}",
+            )
+            full_tokens.append(response.token)
 
     def test_model_shard_preserves_global_expert_names_in_every_backbone_layer(self):
         class Group:
