@@ -5271,6 +5271,7 @@ class DeepseekV41Transformer(nn.Module):
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
         self.engram_layout = validate_engram_config(config)
         self.engram_hash: Optional[EngramNgramHasher] = None
+        self._diagnostic_calls = 0
         self.embed = DeepseekV41DSparkEmbedding(config.vocab_size, config.hidden_size)
         policies = resolve_attention_layer_policies(config)
         vision_on = vision_enabled(args)
@@ -5390,7 +5391,31 @@ class DeepseekV41Transformer(nn.Module):
             hidden, pre_mix = layer(hidden, pre_mix, layer_cache, image_mask)
 
         hidden = hc_pre(hidden, pre_mix)
-        logits = self.head(self.norm(hidden), full_logits=True)
+        normalized_hidden = self.norm(hidden)
+        logits = self.head(normalized_hidden, full_logits=True)
+        if (
+            os.environ.get(_DIAGNOSTIC_ENV) == "1"
+            and self._diagnostic_calls < 17
+        ):
+            last_logits = np.asarray(logits[0, -1].astype(mx.float32))
+            top_count = min(5, last_logits.size)
+            top_ids = np.argpartition(-last_logits, top_count - 1)[:top_count]
+            top_ids = top_ids[np.argsort(-last_logits[top_ids])]
+            _diagnostic_trace(
+                "model_output",
+                call=self._diagnostic_calls,
+                start_pos=start_pos,
+                input_shape=list(input_ids.shape),
+                input_tail=np.asarray(input_ids).reshape(-1)[-16:].tolist(),
+                cache_offset=cache[0].offset,
+                hidden_norm=_diagnostic_norm(normalized_hidden[:, -1]),
+                logits_norm=float(np.linalg.norm(last_logits)),
+                finite_logits=int(np.isfinite(last_logits).sum()),
+                vocab_size=int(last_logits.size),
+                top_ids=top_ids.tolist(),
+                top_logits=last_logits[top_ids].tolist(),
+            )
+            self._diagnostic_calls += 1
         main_hidden = (
             mx.concatenate(main_hiddens, axis=-1) if main_hiddens else None
         )

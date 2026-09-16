@@ -48,7 +48,9 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import asdict
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -4314,6 +4316,41 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
                 for name, _ in tree_flatten(model.parameters())
             )
         )
+
+    def test_trace_reports_the_model_logit_boundary(self):
+        model = Model(self._args())
+        model.embed.weight = mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
+        model.head.weight = mx.eye(64, 32, dtype=mx.float32)
+        prior = os.environ.get("MLX_LM_DEEPSEEK_V41_TRACE")
+        os.environ["MLX_LM_DEEPSEEK_V41_TRACE"] = "1"
+        trace = StringIO()
+        try:
+            with redirect_stderr(trace):
+                model(mx.array([[1, 2, 3]], dtype=mx.int32))
+        finally:
+            if prior is None:
+                os.environ.pop("MLX_LM_DEEPSEEK_V41_TRACE", None)
+            else:
+                os.environ["MLX_LM_DEEPSEEK_V41_TRACE"] = prior
+
+        events = [
+            json.loads(line.removeprefix("DEEPSEEK_V41_TRACE "))
+            for line in trace.getvalue().splitlines()
+            if '"event": "model_output"' in line
+        ]
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["call"], 0)
+        self.assertEqual(event["start_pos"], 0)
+        self.assertEqual(event["input_shape"], [1, 3])
+        self.assertEqual(event["input_tail"], [1, 2, 3])
+        self.assertEqual(event["cache_offset"], 3)
+        self.assertEqual(event["finite_logits"], 64)
+        self.assertEqual(event["vocab_size"], 64)
+        self.assertEqual(len(event["top_ids"]), 5)
+        self.assertEqual(len(event["top_logits"]), 5)
+        self.assertGreater(event["hidden_norm"], 0.0)
+        self.assertGreater(event["logits_norm"], 0.0)
 
     def test_exo_prefill_rollback_and_tail_replay_matches_clean_decode(self):
         model = Model(self._args(with_compressed_cache=True))
