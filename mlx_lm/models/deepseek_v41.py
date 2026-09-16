@@ -1461,6 +1461,15 @@ class DeepseekV41AttentionCache(_BaseCache):
             self._rollback.pop()
         return n
 
+    @classmethod
+    def merge(cls, caches):
+        if len(caches) != 1:
+            raise ValueError(
+                "deepseek_v41 attention caches currently support one active "
+                f"sequence per batch, got {len(caches)}"
+            )
+        return caches[0]
+
     @property
     def nbytes(self) -> int:
         # Only count the buffers this layer actually owns, so summing over the

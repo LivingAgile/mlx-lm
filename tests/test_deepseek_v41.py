@@ -55,6 +55,7 @@ import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_flatten
 
+from mlx_lm.generate import _merge_caches
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.deepseek_v41 import (
     COMPRESS_KV_FP4_BLOCK_SIZE,
@@ -891,6 +892,25 @@ class TestDeepseekV41CacheOwnership(unittest.TestCase):
         outputs = stack([continuation] * len(stack.layers), caches)
         mx.eval(outputs)
         self.assertTrue(all(output.shape == (1, 1, config.hidden_size) for output in outputs))
+
+    def test_exo_singleton_batch_merge_accepts_cache_with_history(self):
+        config = _tiny_text_config()
+        stack = DeepseekV41AttentionStack(config)
+        mx.eval(stack.parameters())
+        caches = stack.make_cache()
+
+        prompt = mx.random.normal((1, 3, config.hidden_size))
+        stack([prompt] * len(stack.layers), caches)
+        merged = _merge_caches([caches])
+
+        self.assertEqual(len(merged), len(caches))
+        self.assertTrue(all(actual is expected for actual, expected in zip(merged, caches)))
+        self.assertIs(merged[3].compress_kv_owner, merged[2].compress_kv_writer)
+
+        continuation = mx.random.normal((1, 1, config.hidden_size))
+        outputs = stack([continuation] * len(stack.layers), merged)
+        mx.eval(outputs)
+        self.assertTrue(all(cache.offset == 4 for cache in merged))
 
     def test_malformed_config_is_rejected_at_cache_construction(self):
         with self.assertRaises(ValueError):
