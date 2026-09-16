@@ -1470,6 +1470,20 @@ class DeepseekV41AttentionCache(_BaseCache):
             )
         return caches[0]
 
+    def extract(self, idx):
+        if idx != 0:
+            raise IndexError(
+                "deepseek_v41 singleton attention cache only has batch index 0"
+            )
+        return self
+
+    def filter(self, batch_indices):
+        if list(batch_indices) != [0]:
+            raise ValueError(
+                "deepseek_v41 attention caches currently support retaining only "
+                f"the singleton batch index, got {list(batch_indices)}"
+            )
+
     @property
     def nbytes(self) -> int:
         # Only count the buffers this layer actually owns, so summing over the

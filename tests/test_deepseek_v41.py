@@ -912,6 +912,11 @@ class TestDeepseekV41CacheOwnership(unittest.TestCase):
         mx.eval(outputs)
         self.assertTrue(all(cache.offset == 4 for cache in merged))
 
+        extracted = [cache.extract(0) for cache in merged]
+        self.assertTrue(all(actual is expected for actual, expected in zip(extracted, merged)))
+        for cache in merged:
+            cache.filter([0])
+
     def test_malformed_config_is_rejected_at_cache_construction(self):
         with self.assertRaises(ValueError):
             make_deepseek_v41_attention_caches(
