@@ -2659,6 +2659,40 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
         self.assertEqual(lookup, [0, 0, 1])
         self.assertEqual(size, 2)
 
+    def test_trailing_multimodal_placeholders_do_not_expand_engram_vocab(self):
+        class _Backend:
+            tokens = [
+                "a",
+                "A",
+                "b",
+                "<|place_holder_mm_span_0036|>",
+                "<|place_holder_mm_span_0037|>",
+            ]
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                self.assertFalse(skip_special_tokens)
+                return self.tokens[token_ids[0]]
+
+            def id_to_token(self, token_id):
+                return self.tokens[token_id]
+
+            def assertFalse(self, value):
+                if value:
+                    raise AssertionError("special tokens must remain visible")
+
+        class _Tokenizer:
+            backend_tokenizer = _Backend()
+
+            def __len__(self):
+                return len(self.backend_tokenizer.tokens)
+
+        lookup, size = build_engram_compressed_token_map_from_tokenizer(
+            _Tokenizer(), expected_size=2, fallback_token_id=0
+        )
+
+        self.assertEqual(lookup, [0, 0, 1, 0, 0])
+        self.assertEqual(size, 2)
+
 
 class TestDeepseekV41EngramLayout(unittest.TestCase):
     """Prime bucket layout, checked against the real pinned config."""
