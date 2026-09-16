@@ -5712,6 +5712,7 @@ class Model(nn.Module):
                     if world_size == 1
                     else lambda value: mx.distributed.all_sum(value, group=group)
                 ),
+                block_size=store.block_size,
             )
             modules[layer_id] = DeepseekV41Engram(
                 self.args.text_config, layer_id, layout, embedding
