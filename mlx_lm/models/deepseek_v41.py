@@ -3810,6 +3810,9 @@ class EngramRowStore:
         """Return ([n, dim] uint8 weight, [n, dim // block] uint8 scale)."""
         raise NotImplementedError
 
+    def dequantize_rows(self, weight, scale, dtype=mx.bfloat16) -> mx.array:
+        return dequantize_engram_rows(weight, scale, self.block_size, dtype)
+
     def close(self) -> None:
         pass
 
@@ -4012,6 +4015,179 @@ class SafetensorsEngramRowStore(EngramRowStore):
         self._handle = None
 
 
+class SafetensorsQuantizedEngramRowStore(EngramRowStore):
+    """Row-addressed MLX group-quantized Engram table.
+
+    Only selected rows are read and passed to ``mx.dequantize``; the dense
+    table is never materialized.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        weight_key: str = "weight",
+        scale_key: str = "scales",
+        bias_key: str = "biases",
+        group_size: int = 64,
+        bits: int = 6,
+        row_start: int = 0,
+        num_rows: Optional[int] = None,
+    ):
+        if bits not in (4, 6, 8):
+            raise ValueError(
+                f"Engram quantization bits must be 4, 6, or 8, got {bits}"
+            )
+        if group_size < 1 or group_size % 32:
+            raise ValueError(
+                f"Engram group_size must be a positive multiple of 32, "
+                f"got {group_size}"
+            )
+        self.path = str(path)
+        self.weight_key = weight_key
+        self.scale_key = scale_key
+        self.bias_key = bias_key
+        self.group_size = int(group_size)
+        self.block_size = self.group_size
+        self.bits = int(bits)
+        self.rows_read = 0
+        self.bytes_read = 0
+        self._handle = None
+
+        with open(self.path, "rb") as handle:
+            raw_len = handle.read(8)
+            if len(raw_len) != 8:
+                raise ValueError(f"{self.path} has no safetensors header length")
+            header_len = int.from_bytes(raw_len, "little", signed=False)
+            if header_len < 2 or header_len > _SAFETENSORS_HEADER_LIMIT:
+                raise ValueError(
+                    f"{self.path} declares an implausible safetensors header length"
+                )
+            header = json.loads(handle.read(header_len).decode("utf-8"))
+            handle.seek(0, 2)
+            file_size = handle.tell()
+        self._data_start = 8 + header_len
+
+        weight_shape, self._weight_begin = self._entry(
+            header, weight_key, "U32", 4, file_size
+        )
+        scale_shape, self._scale_begin = self._entry(
+            header, scale_key, "BF16", 2, file_size
+        )
+        bias_shape, self._bias_begin = self._entry(
+            header, bias_key, "BF16", 2, file_size
+        )
+        self.full_num_rows, self.packed_dim = weight_shape
+        self.scale_dim = scale_shape[1]
+        if scale_shape != bias_shape or scale_shape[0] != self.full_num_rows:
+            raise ValueError(
+                f"{self.path} quantized Engram scales {scale_shape} and biases "
+                f"{bias_shape} must share the weight row count "
+                f"{self.full_num_rows}"
+            )
+        self.dim = self.scale_dim * self.group_size
+        expected_packed_dim = (
+            self.scale_dim * self.bits * self.group_size // 32
+        )
+        if self.packed_dim != expected_packed_dim:
+            raise ValueError(
+                f"{self.path}:{weight_key} has {self.packed_dim} uint32 words per "
+                f"row but {self.scale_dim} groups at group_size={self.group_size}, "
+                f"bits={self.bits} require {expected_packed_dim}"
+            )
+        self.row_start = int(row_start)
+        self.num_rows = self.full_num_rows if num_rows is None else int(num_rows)
+        if self.row_start < 0 or self.num_rows < 1:
+            raise ValueError("row_start must be nonnegative and num_rows positive")
+        if self.row_start + self.num_rows > self.full_num_rows:
+            raise ValueError(
+                f"row range [{self.row_start}, "
+                f"{self.row_start + self.num_rows}) exceeds the "
+                f"{self.full_num_rows}-row table"
+            )
+        self._weight_begin += self._data_start
+        self._scale_begin += self._data_start
+        self._bias_begin += self._data_start
+
+    @property
+    def row_nbytes(self) -> int:
+        return self.packed_dim * 4 + self.scale_dim * 4
+
+    def _entry(self, header, key, dtype, itemsize, file_size):
+        if key not in header:
+            raise ValueError(f"{self.path} has no tensor named {key!r}")
+        entry = header[key]
+        if entry.get("dtype") != dtype:
+            raise ValueError(
+                f"{self.path}:{key} has dtype {entry.get('dtype')!r}, "
+                f"expected {dtype}"
+            )
+        shape = entry.get("shape")
+        offsets = entry.get("data_offsets")
+        if not isinstance(shape, list) or len(shape) != 2:
+            raise ValueError(f"{self.path}:{key} must be a 2-D tensor")
+        if not isinstance(offsets, list) or len(offsets) != 2:
+            raise ValueError(f"{self.path}:{key} has malformed data_offsets")
+        begin, end = map(int, offsets)
+        expected = int(shape[0]) * int(shape[1]) * itemsize
+        if (
+            begin < 0
+            or end - begin != expected
+            or self._data_start + end > file_size
+        ):
+            raise ValueError(
+                f"{self.path}:{key} byte range does not match shape {shape} "
+                f"and dtype {dtype}"
+            )
+        return (int(shape[0]), int(shape[1])), begin
+
+    def _file(self):
+        if self._handle is None or self._handle.closed:
+            self._handle = open(self.path, "rb")
+        return self._handle
+
+    def read_rows(self, row_ids):
+        ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+        if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= self.num_rows):
+            raise IndexError("quantized Engram row id is outside this rank shard")
+        weight = np.empty((ids.size, self.packed_dim), dtype=np.uint32)
+        scales = np.empty((ids.size, self.scale_dim), dtype=np.uint16)
+        biases = np.empty((ids.size, self.scale_dim), dtype=np.uint16)
+        handle = self._file()
+        for position, row_id in enumerate((ids + self.row_start).tolist()):
+            fields = (
+                (self._weight_begin, self.packed_dim * 4, weight, np.dtype("<u4")),
+                (self._scale_begin, self.scale_dim * 2, scales, np.dtype("<u2")),
+                (self._bias_begin, self.scale_dim * 2, biases, np.dtype("<u2")),
+            )
+            for begin, width, target, storage_dtype in fields:
+                handle.seek(begin + row_id * width)
+                chunk = handle.read(width)
+                if len(chunk) != width:
+                    raise ValueError(
+                        f"{self.path} quantized Engram row {row_id} is truncated"
+                    )
+                target[position] = np.frombuffer(chunk, dtype=storage_dtype)
+        self.rows_read += int(ids.size)
+        self.bytes_read += int(ids.size) * self.row_nbytes
+        return weight, (scales, biases)
+
+    def dequantize_rows(self, weight, scale_bias, dtype=mx.bfloat16) -> mx.array:
+        scales, biases = scale_bias
+        rows = mx.dequantize(
+            mx.array(weight),
+            mx.array(scales).view(mx.bfloat16),
+            mx.array(biases).view(mx.bfloat16),
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+        return rows.astype(dtype)
+
+    def close(self) -> None:
+        if self._handle is not None and not self._handle.closed:
+            self._handle.close()
+        self._handle = None
+
+
 class EngramCacheStats:
     """Observable cost of an Engram gather: what was asked for vs what was read."""
 
@@ -4114,12 +4290,8 @@ class BoundedEngramRowCache:
         self.stats.calls += 1
         self.stats.requested_rows += int(ids.size)
         if ids.size == 0:
-            return (
-                np.empty((0,), dtype=np.int64),
-                np.empty((0, self.dim), dtype=np.uint8),
-                np.empty((0, self.store.scale_dim), dtype=np.uint8),
-                np.empty((0,), dtype=np.int64),
-            )
+            weight, scale = self.store.read_rows(ids)
+            return np.empty((0,), dtype=np.int64), weight, scale, ids
 
         # First-seen order, not sorted order: the LRU recency this produces is
         # the order the caller actually asked in.
@@ -4140,14 +4312,23 @@ class BoundedEngramRowCache:
             fetched_w, fetched_s = self.store.read_rows(missing)
             self.stats.rows_fetched += len(missing)
             for position, row_id in enumerate(missing):
-                self._entries[row_id] = (fetched_w[position], fetched_s[position])
+                scale = (
+                    (fetched_s[0][position], fetched_s[1][position])
+                    if isinstance(fetched_s, tuple)
+                    else fetched_s[position]
+                )
+                self._entries[row_id] = (fetched_w[position], scale)
 
-        weight = np.empty((unique_ids.size, self.dim), dtype=np.uint8)
-        scale = np.empty((unique_ids.size, self.store.scale_dim), dtype=np.uint8)
-        for position, row_id in enumerate(unique_ids.tolist()):
-            entry = self._entries[int(row_id)]
-            weight[position] = entry[0]
-            scale[position] = entry[1]
+        entries = [self._entries[int(row_id)] for row_id in unique_ids.tolist()]
+        weight = np.stack([entry[0] for entry in entries])
+        if isinstance(entries[0][1], tuple):
+            scale = tuple(
+                np.stack([entry[1][part] for entry in entries])
+                for part in range(2)
+            )
+        else:
+            scale = np.stack([entry[1] for entry in entries])
+        for row_id in unique_ids.tolist():
             self._entries.move_to_end(int(row_id))
 
         while len(self._entries) > self.max_rows:
@@ -4158,7 +4339,7 @@ class BoundedEngramRowCache:
     def gather_rows(self, row_ids, dtype=mx.bfloat16) -> mx.array:
         """Dequantized [n_requested, dim] rows, in request order."""
         _, weight, scale, inverse = self.gather_packed(row_ids)
-        rows = dequantize_engram_rows(weight, scale, self.block_size, dtype)
+        rows = self.store.dequantize_rows(weight, scale, dtype)
         if rows.shape[0] == 0:
             return rows
         return mx.take(rows, mx.array(inverse.astype(np.int32)), axis=0)

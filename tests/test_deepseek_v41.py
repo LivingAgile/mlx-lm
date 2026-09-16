@@ -86,6 +86,7 @@ from mlx_lm.models.deepseek_v41 import (
     PhysicalLatentCache,
     QuantizationConfig,
     SafetensorsEngramRowStore,
+    SafetensorsQuantizedEngramRowStore,
     TEXT,
     TextConfig,
     VisionConfig,
@@ -2536,6 +2537,31 @@ def _write_engram_fixture(
     return path
 
 
+def _write_quantized_engram_fixture(path, weight, scales, biases):
+    arrays = (
+        ("weight", np.ascontiguousarray(weight, dtype="<u4"), "U32"),
+        ("scales", np.ascontiguousarray(scales, dtype="<u2"), "BF16"),
+        ("biases", np.ascontiguousarray(biases, dtype="<u2"), "BF16"),
+    )
+    header = {}
+    offset = 0
+    for name, array, dtype in arrays:
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(array.shape),
+            "data_offsets": [offset, offset + array.nbytes],
+        }
+        offset += array.nbytes
+    blob = json.dumps(header).encode("utf-8")
+    blob += b" " * ((-len(blob)) % 8)
+    with open(path, "wb") as handle:
+        handle.write(len(blob).to_bytes(8, "little"))
+        handle.write(blob)
+        for _, array, _ in arrays:
+            handle.write(array.tobytes())
+    return path
+
+
 def _random_engram_shard(n_rows, dim, block_size, seed):
     """Packed bytes for a tiny Engram shard: E4M3 values plus E8M0 row scales.
 
@@ -3067,6 +3093,46 @@ class TestDeepseekV41EngramRowStore(unittest.TestCase):
             handle.write(b"not a safetensors file")
         with self.assertRaises(ValueError):
             SafetensorsEngramRowStore(path)
+
+
+class TestDeepseekV41QuantizedEngramRowStore(unittest.TestCase):
+    def test_selected_six_bit_rows_match_mlx_dequantize(self):
+        rng = np.random.default_rng(41)
+        dense = mx.array(rng.normal(size=(8, 256)).astype(np.float32))
+        weight, scales, biases = mx.quantize(dense, group_size=64, bits=6)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_quantized_engram_fixture(
+                os.path.join(tmp, "engram6.safetensors"),
+                np.asarray(weight),
+                np.asarray(scales).view(np.uint16),
+                np.asarray(biases).view(np.uint16),
+            )
+            with SafetensorsQuantizedEngramRowStore(path, bits=6) as store:
+                cache = BoundedEngramRowCache(store, max_rows=2)
+                wanted = np.array([7, 1, 7], dtype=np.int64)
+                actual = cache.gather_rows(wanted, dtype=mx.float32)
+                expected = mx.take(
+                    mx.dequantize(
+                        weight, scales, biases, group_size=64, bits=6
+                    ),
+                    mx.array(wanted),
+                    axis=0,
+                )
+                self.assertTrue(mx.allclose(actual, expected))
+                self.assertEqual(store.rows_read, 2)
+                self.assertEqual(store.bytes_read, 2 * store.row_nbytes)
+                self.assertEqual(cache.nbytes(), 2 * store.row_nbytes)
+
+    def test_six_bit_geometry_is_validated_before_any_row_read(self):
+        weight = np.zeros((2, 47), dtype=np.uint32)
+        scales = np.zeros((2, 4), dtype=np.uint16)
+        biases = np.zeros((2, 4), dtype=np.uint16)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_quantized_engram_fixture(
+                os.path.join(tmp, "bad.safetensors"), weight, scales, biases
+            )
+            with self.assertRaisesRegex(ValueError, "require 48"):
+                SafetensorsQuantizedEngramRowStore(path, bits=6)
 
 
 class TestDeepseekV41EngramRowCache(unittest.TestCase):
