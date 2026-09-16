@@ -4400,6 +4400,30 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             )
             full_tokens.append(response.token)
 
+    def test_native_batch_decode_matches_clean_logits_across_window_rollover(self):
+        args = self._args(with_compressed_cache=True)
+        args.text_config.sliding_window = 128
+        model = Model(args)
+        model.embed.weight = mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
+        model.head.weight = mx.eye(64, 32, dtype=mx.float32)
+        prompt = [1 + (token % 63) for token in range(77)]
+
+        batch_generation = BatchGenerator(model, stop_tokens=[], prefill_step_size=4096)
+        batch_generation.insert(prompts=[prompt], max_tokens=[64])
+        full_tokens = list(prompt)
+        for step in range(64):
+            responses = batch_generation.next_generated()
+            self.assertEqual(len(responses), 1)
+            response = responses[0]
+            clean_logits = model(mx.array([full_tokens], dtype=mx.int32))[:, -1, :]
+            clean_logprobs = clean_logits - mx.logsumexp(clean_logits, keepdims=True)
+            mx.eval(clean_logprobs, response.logprobs)
+            self.assertTrue(
+                mx.allclose(response.logprobs, clean_logprobs[0], atol=1e-4, rtol=1e-4),
+                f"native batch cache diverged at decode step {step}",
+            )
+            full_tokens.append(response.token)
+
     def test_model_shard_preserves_global_expert_names_in_every_backbone_layer(self):
         class Group:
             def size(self):
