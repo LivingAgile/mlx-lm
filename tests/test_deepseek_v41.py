@@ -3775,7 +3775,12 @@ class TestDeepseekV41DSpark(unittest.TestCase):
             first.main_proj.scale.shape, 127, dtype=mx.uint8
         )
         for layer in model.mtp:
-            layer.attn.wkv.weight = mx.eye(32, dtype=mx.float32)
+            layer.attn.wkv.weight = mx.array(
+                np.eye(32, dtype=np.uint8) * 0x38
+            )
+            layer.attn.wkv.scale = mx.full(
+                layer.attn.wkv.scale.shape, 127, dtype=mx.uint8
+            )
         prefill_hidden = mx.arange(256, dtype=mx.float32).reshape(1, 4, 64) / 256
         self.assertIsNone(
             model.forward_spec(mx.array([7], dtype=mx.int32), prefill_hidden)
@@ -4239,8 +4244,11 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             model.embed.weight = (
                 mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
             )
-            model.layers[0].engram.wkv.weight = mx.ones_like(
-                model.layers[0].engram.wkv.weight
+            model.layers[0].engram.wkv.weight = mx.full(
+                model.layers[0].engram.wkv.weight.shape, 0x38, dtype=mx.uint8
+            )
+            model.layers[0].engram.wkv.scale = mx.full(
+                model.layers[0].engram.wkv.scale.shape, 127, dtype=mx.uint8
             )
             model._runtime.bind_engram_hasher(
                 EngramNgramHasher(
