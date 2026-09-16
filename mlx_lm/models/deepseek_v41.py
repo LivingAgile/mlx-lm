@@ -132,7 +132,7 @@ def _diagnostic_trace(event: str, **fields) -> None:
 
 
 def _diagnostic_norm(value: mx.array) -> float:
-    array = np.asarray(value).astype(np.float32, copy=False)
+    array = np.asarray(value.astype(mx.float32))
     return float(np.linalg.norm(array.reshape(-1)))
 
 
