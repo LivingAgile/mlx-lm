@@ -3916,6 +3916,24 @@ class TestDeepseekV41VisionMerge(unittest.TestCase):
 class TestDeepseekV41PublicNames(unittest.TestCase):
     """Official public tensor naming, including remaining gate-bias and wo_a."""
 
+    def test_official_model_owns_packed_scale_leaves(self):
+        model = Model(ModelArgs.from_dict(_full_config_dict()))
+        names = dict(tree_flatten(model.parameters()))
+
+        for name in (
+            "layers.0.attn.wq_a.scale",
+            "layers.0.attn.wq_b.scale",
+            "layers.0.attn.wkv.scale",
+            "layers.0.attn.wo_b.scale",
+            "layers.2.attn.indexer.wq_b.scale",
+            "mtp.0.attn.wq_a.scale",
+            "mtp.0.attn.wq_b.scale",
+            "mtp.0.attn.wkv.scale",
+            "mtp.0.attn.wo_b.scale",
+            "mtp.0.main_proj.scale",
+        ):
+            self.assertIn(name, names)
+
     def test_convert_mapping_preserves_gate_bias_wo_a_and_vision_names(self):
         self.assertEqual(
             public_checkpoint_name("model.layers.0.self_attn.wo_a.weight"),
@@ -4209,6 +4227,7 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             )
             names = dict(tree_flatten(model.parameters()))
             self.assertIn("layers.0.engram.wkv.weight", names)
+            self.assertIn("layers.0.engram.wkv.scale", names)
             self.assertIn("layers.0.engram.q_weight", names)
             self.assertNotIn(weight_key, names)
             embedding = model.layers[0].engram.embed
