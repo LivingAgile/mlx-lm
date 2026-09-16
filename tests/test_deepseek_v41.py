@@ -43,6 +43,7 @@ formulas. Token counts for fixed synthetic images are pinned against the
 official ``plan_image_grid`` / ``num_image_tokens`` arithmetic; span replacement
 overwrites IMAGE slots with aligner rows and leaves text-only streams untouched.
 """
+import hashlib
 import json
 import os
 import tempfile
@@ -57,6 +58,7 @@ from mlx.utils import tree_flatten
 
 from mlx_lm.generate import BatchGenerator, _merge_caches, generate_step
 from mlx_lm.models.base import BaseModelArgs
+from mlx_lm.tokenizer_utils import load as load_tokenizer
 from mlx_lm.models.deepseek_v41 import (
     COMPRESS_KV_FP4_BLOCK_SIZE,
     ENGRAM_FP8_BLOCK_SIZE,
@@ -2744,7 +2746,7 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
         self.assertEqual(lookup, [0, 0, 1])
         self.assertEqual(size, 2)
 
-    def test_trailing_multimodal_placeholders_do_not_expand_engram_vocab(self):
+    def test_tokenizer_extensions_fail_closed(self):
         class _Backend:
             tokens = [
                 "a",
@@ -2772,12 +2774,10 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
             def __len__(self):
                 return len(self.backend_tokenizer.tokens)
 
-        lookup, size = build_engram_compressed_token_map_from_tokenizer(
-            _Tokenizer(), expected_size=2, fallback_token_id=0
-        )
-
-        self.assertEqual(lookup, [0, 0, 1, 0, 0, 0])
-        self.assertEqual(size, 2)
+        with self.assertRaisesRegex(ValueError, "checkpoint config requires 2"):
+            build_engram_compressed_token_map_from_tokenizer(
+                _Tokenizer(), expected_size=2
+            )
 
     def test_tokenizer_extension_rejects_every_unproven_shape(self):
         class _Backend:
@@ -2802,23 +2802,18 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
         cases = (
             (
                 ["a", "b"],
-                {"expected_size": 3, "fallback_token_id": 0},
+                {"expected_size": 3},
                 "checkpoint config requires 3",
             ),
             (
                 ["a", "b", "<|place_holder_mm_span_0036|>", "a", "<|place_holder_mm_span_0037|>"],
-                {"expected_size": 2, "fallback_token_id": 0},
-                "contiguous suffix",
+                {"expected_size": 2},
+                "checkpoint config requires 2",
             ),
             (
                 ["a", "b", "<|unknown_multimodal_token|>"],
-                {"expected_size": 2, "fallback_token_id": 0},
-                "contiguous suffix",
-            ),
-            (
-                ["a", "b", "<|place_holder_mm_span_0036|>"],
-                {"expected_size": 2, "fallback_token_id": 3},
-                "outside tokenizer vocabulary",
+                {"expected_size": 2},
+                "checkpoint config requires 2",
             ),
         )
         for tokens, kwargs, message in cases:
@@ -2827,9 +2822,9 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
                     _Tokenizer(tokens), **kwargs
                 )
 
-    def test_model_binding_passes_checkpoint_size_and_compressed_pad_id(self):
+    def test_model_binding_uses_the_exact_checkpoint_map(self):
         class _Backend:
-            tokens = ["A", "a", "b", "<|place_holder_mm_span_0036|>"]
+            tokens = ["A", "a", "b"]
 
             def decode(self, token_ids, skip_special_tokens=False):
                 if skip_special_tokens:
@@ -2861,7 +2856,31 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
         Model.bind_tokenizer(model, _Tokenizer())
 
         self.assertEqual(runtime.hasher.compressed_vocab_size, 2)
-        self.assertEqual(runtime.hasher.token_map.tolist(), [0, 0, 1, 0])
+        self.assertEqual(runtime.hasher.token_map.tolist(), [0, 0, 1])
+
+    def test_pinned_official_tokenizer_produces_the_exact_map(self):
+        model_path_value = os.environ.get("DEEPSEEK_V41_OFFICIAL_MODEL_PATH")
+        if model_path_value is None:
+            self.skipTest("DEEPSEEK_V41_OFFICIAL_MODEL_PATH is not set")
+
+        model_path = Path(model_path_value)
+        tokenizer_bytes = (model_path / "tokenizer.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(tokenizer_bytes).hexdigest(),
+            "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+        )
+
+        lookup, size = build_engram_compressed_token_map_from_tokenizer(
+            load_tokenizer(model_path), expected_size=99092
+        )
+        lookup_bytes = np.asarray(lookup, dtype="<u4").tobytes()
+
+        self.assertEqual(len(lookup), 129280)
+        self.assertEqual(size, 99092)
+        self.assertEqual(
+            hashlib.sha256(lookup_bytes).hexdigest(),
+            "c60a86322ec17b4142bfef3c57a8d81fb428550cdf487f88a4320cb59fe46481",
+        )
 
 
 class TestDeepseekV41EngramLayout(unittest.TestCase):
