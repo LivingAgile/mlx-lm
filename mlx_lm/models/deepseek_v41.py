@@ -2889,10 +2889,10 @@ class DeepseekV41MoE(nn.Module):
 
         trace = (
             os.environ.get(_DIAGNOSTIC_ENV) == "1"
-            and self.layer_id in (0, 1, 14)
             and self._diagnostic_calls < 2
         )
         if trace:
+            input_norm = _diagnostic_norm(flat)
             local_y_norm = _diagnostic_norm(y)
         if self.world_size > 1:
             y = self.all_reduce(y)
@@ -2917,6 +2917,7 @@ class DeepseekV41MoE(nn.Module):
                 ),
                 expert_start=self.experts_start_idx,
                 expert_end=self.experts_end_idx,
+                input_norm=input_norm,
                 local_routed_norm=local_y_norm,
                 reduced_routed_norm=_diagnostic_norm(y),
                 shared_norm=_diagnostic_norm(shared),
