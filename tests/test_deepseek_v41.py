@@ -48,6 +48,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from contextlib import redirect_stderr
 from dataclasses import asdict
 from io import StringIO
@@ -98,6 +99,7 @@ from mlx_lm.models.deepseek_v41 import (
     VisionConfig,
     act_quant_roundtrip,
     apply_rope_tail,
+    _deterministic_all_sum,
     build_engram_compressed_token_map,
     build_engram_compressed_token_map_from_tokenizer,
     compute_engram_hash_multipliers,
@@ -2159,6 +2161,17 @@ class TestDeepseekV41MoE(unittest.TestCase):
     # preserve a mixed bound instead of requiring unsupported bitwise behavior.
     MOE_BATCH_ATOL = 1.0 / 32.0
     MOE_BATCH_RTOL = 5e-5
+
+    def test_distributed_sum_uses_one_rank_order_on_every_peer(self):
+        value = mx.array([[1.0, 2.0]], dtype=mx.float32)
+        gathered = mx.array(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+            dtype=mx.float32,
+        )
+        group = SimpleNamespace(size=lambda: 4)
+        with patch.object(mx.distributed, "all_gather", return_value=gathered):
+            reduced = _deterministic_all_sum(value, group)
+        np.testing.assert_array_equal(np.asarray(reduced), [[16.0, 20.0]])
 
     def test_routed_and_shared_outputs_are_summed_per_token(self):
         config, moe = _build_tiny_moe()

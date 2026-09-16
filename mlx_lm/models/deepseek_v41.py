@@ -171,6 +171,12 @@ def _diagnostic_previous_token_cosine(
     return cosine, current.copy()
 
 
+def _deterministic_all_sum(value: mx.array, group) -> mx.array:
+    gathered = mx.distributed.all_gather(value, group=group)
+    gathered = gathered.reshape(group.size(), *value.shape)
+    return mx.sum(gathered, axis=0)
+
+
 @dataclass
 class VisionConfig(BaseModelArgs):
     model_type: str
@@ -2876,7 +2882,7 @@ class DeepseekV41MoE(nn.Module):
         self.all_reduce = (
             None
             if world_size == 1
-            else lambda value: mx.distributed.all_sum(value, group=group)
+            else lambda value: _deterministic_all_sum(value, group)
         )
 
     def __call__(
@@ -5620,7 +5626,7 @@ class Model(nn.Module):
                 all_reduce=(
                     None
                     if world_size == 1
-                    else lambda value: mx.distributed.all_sum(value, group=group)
+                    else lambda value: _deterministic_all_sum(value, group)
                 ),
             )
             modules[layer_id] = DeepseekV41Engram(
