@@ -4361,8 +4361,17 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             for line in trace.getvalue().splitlines()
             if '"event": "model_output"' in line
         ]
+        moe_events = [
+            json.loads(line.removeprefix("DEEPSEEK_V41_TRACE "))
+            for line in trace.getvalue().splitlines()
+            if '"event": "moe"' in line
+        ]
         self.assertEqual(len(events), 2)
         self.assertEqual([event["call"] for event in events], [1, 1])
+        self.assertEqual(
+            [event["call"] for event in moe_events],
+            [0, 0, 1, 1, 0, 0, 1, 1],
+        )
         event = events[0]
         self.assertEqual(event["start_pos"], 3)
         self.assertEqual(event["input_shape"], [1, 1])

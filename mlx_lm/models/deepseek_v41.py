@@ -5361,6 +5361,14 @@ class DeepseekV41Transformer(nn.Module):
         start_pos = cache[0].offset
         if any(layer_cache.offset != start_pos for layer_cache in cache):
             raise ValueError("all backbone layer caches must have the same offset")
+        trace_enabled = os.environ.get(_DIAGNOSTIC_ENV) == "1"
+        if trace_enabled and start_pos == 0:
+            self._diagnostic_calls = 0
+            for layer in self.layers:
+                layer.ffn._diagnostic_calls = 0
+                layer.ffn._diagnostic_previous_input = None
+                if layer.engram is not None:
+                    layer.engram.embed._diagnostic_calls = 0
         image_mask = None
         if token_types is not None:
             if tuple(token_types.shape) != tuple(input_ids.shape):
@@ -5402,9 +5410,6 @@ class DeepseekV41Transformer(nn.Module):
         hidden = hc_pre(hidden, pre_mix)
         normalized_hidden = self.norm(hidden)
         logits = self.head(normalized_hidden, full_logits=True)
-        trace_enabled = os.environ.get(_DIAGNOSTIC_ENV) == "1"
-        if trace_enabled and start_pos == 0:
-            self._diagnostic_calls = 0
         trace_call = self._diagnostic_calls
         if trace_enabled:
             self._diagnostic_calls += 1
