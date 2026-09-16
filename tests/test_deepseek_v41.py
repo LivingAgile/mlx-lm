@@ -876,10 +876,16 @@ class TestDeepseekV41CacheOwnership(unittest.TestCase):
 
         self.assertTrue(all(cache.offset == 3 for cache in caches))
         self.assertTrue(
-            all(owner.length == 1 for owner in caches[0].shared.compress_kv_owners.values())
+            all(
+                owner.length == 3 // owner.compress_ratio
+                for owner in caches[0].shared.compress_kv_owners.values()
+            )
         )
         self.assertTrue(
-            all(owner.length == 1 for owner in caches[0].shared.index_key_owners.values())
+            all(
+                owner.length == 3 // owner.compress_ratio
+                for owner in caches[0].shared.index_key_owners.values()
+            )
         )
 
         outputs = stack([continuation] * len(stack.layers), caches)
