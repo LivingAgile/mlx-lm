@@ -5370,6 +5370,8 @@ class DeepseekV41Transformer(nn.Module):
                 raise RuntimeError(
                     "Engram is configured but not bound to file-backed row stores"
                 )
+            if start_pos == 0:
+                self.engram_hash.reset()
             hashes = self.engram_hash(input_ids, start_pos, engram_mask)
 
         hidden = self.embed(input_ids)
