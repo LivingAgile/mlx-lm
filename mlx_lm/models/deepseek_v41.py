@@ -90,7 +90,6 @@ compressed vocabulary exactly.
 import json
 import math
 import re
-import unicodedata
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,6 +108,8 @@ from typing import (
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from tokenizers import Regex as TokenizerRegex
+from tokenizers import normalizers as tokenizer_normalizers
 
 from .base import BaseModelArgs
 from .cache import _BaseCache
@@ -3286,26 +3287,18 @@ ENGRAM_SPACE_SENTINEL = "\ue000"
 # its raw (id_to_token) form instead.
 _UNICODE_REPLACEMENT_CHAR = "\ufffd"
 
-_ENGRAM_WHITESPACE_RUN = re.compile(r"[ \t\r\n]+")
-
-# The Unicode White_Space property, which is what the official Strip()
-# normalizer trims (Rust char::is_whitespace). Spelled out rather than using
-# str.strip(), whose set is str.isspace() and additionally includes the C0
-# separators U+001C..U+001F -- trimming those would silently diverge.
-_UNICODE_WHITESPACE = frozenset(
-    "\t\n\x0b\x0c\r \x85\xa0\u1680"
-    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
-    "\u2028\u2029\u202f\u205f\u3000"
+_ENGRAM_NORMALIZER = tokenizer_normalizers.Sequence(
+    [
+        tokenizer_normalizers.NFKC(),
+        tokenizer_normalizers.NFD(),
+        tokenizer_normalizers.StripAccents(),
+        tokenizer_normalizers.Lowercase(),
+        tokenizer_normalizers.Replace(TokenizerRegex(r"[ \t\r\n]+"), " "),
+        tokenizer_normalizers.Replace(TokenizerRegex(r"^ $"), ENGRAM_SPACE_SENTINEL),
+        tokenizer_normalizers.Strip(),
+        tokenizer_normalizers.Replace(ENGRAM_SPACE_SENTINEL, " "),
+    ]
 )
-
-
-def _strip_unicode_whitespace(text: str) -> str:
-    start, end = 0, len(text)
-    while start < end and text[start] in _UNICODE_WHITESPACE:
-        start += 1
-    while end > start and text[end - 1] in _UNICODE_WHITESPACE:
-        end -= 1
-    return text[start:end]
 
 
 def normalize_engram_token_text(text: str) -> str:
@@ -3325,17 +3318,7 @@ def normalize_engram_token_text(text: str) -> str:
     """
     if not isinstance(text, str):
         raise TypeError(f"expected a str token text, got {type(text).__name__}")
-    normalized = unicodedata.normalize("NFD", unicodedata.normalize("NFKC", text))
-    normalized = "".join(c for c in normalized if unicodedata.category(c) != "Mn")
-    normalized = normalized.lower()
-    normalized = _ENGRAM_WHITESPACE_RUN.sub(" ", normalized)
-    # The official rule is Replace(Regex(r"^ $"), sentinel) under Rust regex
-    # semantics, where ^ and $ anchor the whole haystack and $ does not also
-    # match before a trailing newline -- i.e. exactly "the string is one space".
-    if normalized == " ":
-        normalized = ENGRAM_SPACE_SENTINEL
-    normalized = _strip_unicode_whitespace(normalized)
-    return normalized.replace(ENGRAM_SPACE_SENTINEL, " ")
+    return _ENGRAM_NORMALIZER.normalize_str(text)
 
 
 def engram_compressed_token_key(decoded_text: str, raw_token: Optional[str]) -> str:
