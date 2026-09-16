@@ -3517,8 +3517,9 @@ class TestDeepseekV41EngramModule(unittest.TestCase):
         module = DeepseekV41Engram(self.config, layer_id, self.layout, embedding)
         rng = np.random.default_rng(seed)
         module.wkv.weight = mx.array(
-            rng.normal(scale=0.1, size=module.wkv.weight.shape).astype(np.float32)
+            rng.integers(1, 120, size=module.wkv.weight.shape, dtype=np.uint8)
         )
+        module.wkv.scale = mx.full(module.wkv.scale.shape, 127, dtype=mx.uint8)
         return module
 
     def _stream_and_ids(self, batch=2, seqlen=4, seed=19, layer_id=1):

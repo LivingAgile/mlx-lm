@@ -1627,7 +1627,7 @@ class DeepseekV41Indexer(nn.Module):
         self.index_topk = config.index_topk
         self.rope_head_dim = config.qk_rope_head_dim
         self.softmax_scale = config.index_head_dim**-0.5
-        self.wq_b = DeepseekV41PackedLinear(
+        self.wq_b = _make_fp8_linear(
             config.q_lora_rank,
             config.index_n_heads * config.index_head_dim,
             quant="fp8",
@@ -1744,16 +1744,16 @@ class DeepseekV41Attention(nn.Module):
         self.softmax_scale = config.head_dim**-0.5
 
         self.attn_sink = mx.zeros((config.num_attention_heads,), dtype=mx.float32)
-        self.wq_a = DeepseekV41PackedLinear(
+        self.wq_a = _make_fp8_linear(
             config.hidden_size, config.q_lora_rank, quant="fp8"
         )
         self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = DeepseekV41PackedLinear(
+        self.wq_b = _make_fp8_linear(
             config.q_lora_rank,
             config.num_attention_heads * config.head_dim,
             quant="fp8",
         )
-        self.wkv = DeepseekV41PackedLinear(
+        self.wkv = _make_fp8_linear(
             config.hidden_size, config.head_dim, quant="fp8"
         )
         self.kv_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
@@ -1763,7 +1763,7 @@ class DeepseekV41Attention(nn.Module):
             config.o_groups * config.o_lora_rank,
             bias=False,
         )
-        self.wo_b = DeepseekV41PackedLinear(
+        self.wo_b = _make_fp8_linear(
             config.o_groups * config.o_lora_rank,
             config.hidden_size,
             quant="fp8",
@@ -2512,6 +2512,11 @@ class DeepseekV41PackedLinear(nn.Module):
                 f"{x.shape}"
             )
         return x.astype(mx.float32) @ self.dequantized().T
+
+
+def _make_fp8_linear(in_features: int, out_features: int) -> DeepseekV41PackedLinear:
+    quant = "fp8" if in_features % FP8_WEIGHT_BLOCK_SIZE == 0 else None
+    return DeepseekV41PackedLinear(in_features, out_features, quant=quant)
 
 
 class DeepseekV41Expert(nn.Module):
@@ -4387,7 +4392,7 @@ class DeepseekV41Engram(nn.Module):
         self.n_hash_cols = layout.n_hash_cols
         self.head_dim = layout.head_dim
         self.embed = embedding
-        self.wkv = DeepseekV41PackedLinear(
+        self.wkv = _make_fp8_linear(
             self.n_hash_cols * layout.head_dim,
             self.dim * (self.hc_mult + 1),
             quant="fp8",
