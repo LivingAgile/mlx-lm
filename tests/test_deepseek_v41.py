@@ -860,6 +860,30 @@ class TestDeepseekV41CacheOwnership(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             _ = cache.meta_state
 
+    def test_exo_warmup_cache_can_be_trimmed_back_to_empty_and_reused(self):
+        config = _tiny_text_config()
+        stack = DeepseekV41AttentionStack(config)
+        mx.eval(stack.parameters())
+        caches = stack.make_cache()
+
+        warmup = mx.random.normal((1, 2, config.hidden_size))
+        stack([warmup] * len(stack.layers), caches)
+        for cache in caches:
+            self.assertEqual(cache.trim(2), 2)
+
+        self.assertTrue(all(cache.offset == 0 for cache in caches))
+        self.assertTrue(
+            all(owner.length == 0 for owner in caches[0].shared.compress_kv_owners.values())
+        )
+        self.assertTrue(
+            all(owner.length == 0 for owner in caches[0].shared.index_key_owners.values())
+        )
+
+        prompt = mx.random.normal((1, 3, config.hidden_size))
+        outputs = stack([prompt] * len(stack.layers), caches)
+        mx.eval(outputs)
+        self.assertTrue(all(output.shape == (1, 3, config.hidden_size) for output in outputs))
+
     def test_malformed_config_is_rejected_at_cache_construction(self):
         with self.assertRaises(ValueError):
             make_deepseek_v41_attention_caches(
