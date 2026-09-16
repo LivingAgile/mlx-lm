@@ -2667,6 +2667,7 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
                 "b",
                 "<|place_holder_mm_span_0036|>",
                 "<|place_holder_mm_span_0037|>",
+                "<｜deepseek_image｜>",
             ]
 
             def decode(self, token_ids, skip_special_tokens=False):
@@ -2690,7 +2691,7 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
             _Tokenizer(), expected_size=2, fallback_token_id=0
         )
 
-        self.assertEqual(lookup, [0, 0, 1, 0, 0])
+        self.assertEqual(lookup, [0, 0, 1, 0, 0, 0])
         self.assertEqual(size, 2)
 
 

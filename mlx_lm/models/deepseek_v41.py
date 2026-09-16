@@ -3321,6 +3321,8 @@ def build_engram_compressed_token_map(
 
 def build_engram_compressed_token_map_from_tokenizer(
     tokenizer,
+    expected_size: Optional[int] = None,
+    fallback_token_id: Optional[int] = None,
 ) -> Tuple[List[int], int]:
     """build_engram_compressed_token_map driven by a real fast tokenizer.
 
@@ -3341,7 +3343,60 @@ def build_engram_compressed_token_map_from_tokenizer(
     for token_id in range(size):
         decoded.append(backend.decode([token_id], skip_special_tokens=False))
         raw.append(backend.id_to_token(token_id))
-    return build_engram_compressed_token_map(decoded, raw)
+    lookup, compressed_size = build_engram_compressed_token_map(decoded, raw)
+    if expected_size is None or compressed_size == expected_size:
+        return lookup, compressed_size
+
+    if compressed_size < expected_size or fallback_token_id is None:
+        raise ValueError(
+            f"tokenizer produces {compressed_size} compressed Engram tokens, "
+            f"but the checkpoint config requires {expected_size}"
+        )
+    if not 0 <= fallback_token_id < len(lookup):
+        raise ValueError(
+            f"Engram fallback token id {fallback_token_id} is outside tokenizer "
+            f"vocabulary size {len(lookup)}"
+        )
+
+    overflow_ids = [
+        token_id
+        for token_id, compressed_id in enumerate(lookup)
+        if compressed_id >= expected_size
+    ]
+    first_overflow = overflow_ids[0] if overflow_ids else len(lookup)
+    placeholder = re.compile(r"<\|place_holder_mm_span_\d{4}\|>")
+    multimodal_controls = {
+        "<｜rl_image_pad｜>",
+        "<｜rl_image_start｜>",
+        "<｜deepseek_image｜>",
+        "<｜/polygon｜>",
+        "<｜polygon｜>",
+        "<｜/point｜>",
+        "<｜point｜>",
+        "<｜/box｜>",
+        "<｜box｜>",
+        "<｜/ref｜>",
+        "<｜ref｜>",
+    }
+    if overflow_ids != list(range(first_overflow, len(lookup))) or any(
+        raw[token_id] != decoded[token_id]
+        or (
+            placeholder.fullmatch(raw[token_id] or "") is None
+            and raw[token_id] not in multimodal_controls
+        )
+        for token_id in overflow_ids
+    ):
+        raise ValueError(
+            f"tokenizer produces {compressed_size} compressed Engram tokens, "
+            f"but the checkpoint config requires {expected_size}; only a contiguous "
+            "suffix of multimodal placeholder tokens may extend the tokenizer after "
+            "Engram training"
+        )
+
+    fallback_id = lookup[fallback_token_id]
+    for token_id in overflow_ids:
+        lookup[token_id] = fallback_id
+    return lookup, expected_size
 
 
 def _is_prime(candidate: int) -> bool:
@@ -5291,10 +5346,14 @@ class Model(nn.Module):
         layout = self._runtime.engram_layout
         if layout is None:
             return
-        token_map, compressed_size = (
-            build_engram_compressed_token_map_from_tokenizer(tokenizer)
-        )
         expected = self.args.text_config.engram_compressed_vocab_size
+        token_map, compressed_size = (
+            build_engram_compressed_token_map_from_tokenizer(
+                tokenizer,
+                expected_size=expected,
+                fallback_token_id=self.args.text_config.engram_pad_token_id,
+            )
+        )
         if compressed_size != expected:
             raise ValueError(
                 f"tokenizer produces {compressed_size} compressed Engram tokens, "
