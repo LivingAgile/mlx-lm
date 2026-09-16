@@ -89,7 +89,9 @@ compressed vocabulary exactly.
 
 import json
 import math
+import os
 import re
+import sys
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +115,25 @@ from tokenizers import normalizers as tokenizer_normalizers
 
 from .base import BaseModelArgs
 from .cache import _BaseCache
+
+
+_DIAGNOSTIC_ENV = "MLX_LM_DEEPSEEK_V41_TRACE"
+
+
+def _diagnostic_trace(event: str, **fields) -> None:
+    if os.environ.get(_DIAGNOSTIC_ENV) != "1":
+        return
+    payload = {"event": event, **fields}
+    print(
+        "DEEPSEEK_V41_TRACE " + json.dumps(payload, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _diagnostic_norm(value: mx.array) -> float:
+    array = np.asarray(value).astype(np.float32, copy=False)
+    return float(np.linalg.norm(array.reshape(-1)))
 
 
 @dataclass
@@ -2755,6 +2776,8 @@ class DeepseekV41MoE(nn.Module):
         self.world_size = world_size
         self.rank = rank
         self.all_reduce = all_reduce
+        self.layer_id = -1
+        self._diagnostic_calls = 0
         start, end = routed_expert_partition(n_routed, world_size, rank)
         self.experts_start_idx = start
         self.experts_end_idx = end
@@ -2864,6 +2887,13 @@ class DeepseekV41MoE(nn.Module):
             )
             y[tokens] = y[tokens] + out.astype(mx.float32)
 
+        trace = (
+            os.environ.get(_DIAGNOSTIC_ENV) == "1"
+            and self.layer_id in (0, 1, 14)
+            and self._diagnostic_calls < 2
+        )
+        if trace:
+            local_y_norm = _diagnostic_norm(y)
         if self.world_size > 1:
             y = self.all_reduce(y)
             if y is None:
@@ -2871,7 +2901,28 @@ class DeepseekV41MoE(nn.Module):
                     "the injected MoE all_reduce returned None; it must return "
                     "the summed routed output"
                 )
-        y = y + self.shared_experts(flat).astype(mx.float32)
+        shared = self.shared_experts(flat).astype(mx.float32)
+        if trace:
+            _diagnostic_trace(
+                "moe",
+                layer=self.layer_id,
+                rank=self.rank,
+                world_size=self.world_size,
+                shape=list(shape),
+                local_assignments=sum(len(pairs) for pairs in buckets.values()),
+                local_owned_assignments=sum(
+                    len(pairs)
+                    for expert_id, pairs in buckets.items()
+                    if self.experts_start_idx <= expert_id < self.experts_end_idx
+                ),
+                expert_start=self.experts_start_idx,
+                expert_end=self.experts_end_idx,
+                local_routed_norm=local_y_norm,
+                reduced_routed_norm=_diagnostic_norm(y),
+                shared_norm=_diagnostic_norm(shared),
+            )
+            self._diagnostic_calls += 1
+        y = y + shared
         return y.astype(x.dtype).reshape(shape)
 
 
@@ -4326,6 +4377,7 @@ class DeepseekV41EngramEmbedding(nn.Module):
             )
         self.cache = cache
         self.all_reduce = all_reduce
+        self._diagnostic_calls = 0
 
     def nbytes(self) -> int:
         """Resident bytes. A function of the cache bound, never of the table."""
@@ -4351,6 +4403,12 @@ class DeepseekV41EngramEmbedding(nn.Module):
         rows = rows.reshape(shape + (self.dim,))
         if bool(mask.any()):
             rows = mx.where(mx.array(mask)[..., None], mx.zeros_like(rows), rows)
+        trace = (
+            os.environ.get(_DIAGNOSTIC_ENV) == "1"
+            and self._diagnostic_calls < 2
+        )
+        if trace:
+            local_norm = _diagnostic_norm(rows)
         if self.world_size > 1:
             if self.all_reduce is None:
                 raise RuntimeError(
@@ -4367,6 +4425,23 @@ class DeepseekV41EngramEmbedding(nn.Module):
                     "the injected all_reduce returned None; it must return the "
                     "summed array (an in-place reducer should return its argument)"
                 )
+        if trace:
+            _diagnostic_trace(
+                "engram",
+                rank=self.rank,
+                world_size=self.world_size,
+                shape=list(shape),
+                id_min=low,
+                id_max=high,
+                owned_ids=int((~mask).sum()),
+                vocab_start=self.vocab_start_idx,
+                vocab_end=self.vocab_end_idx,
+                local_norm=local_norm,
+                reduced_norm=_diagnostic_norm(rows),
+                rows_read=self.cache.store.rows_read,
+                bytes_read=self.cache.store.bytes_read,
+            )
+            self._diagnostic_calls += 1
         return rows
 
 
@@ -5109,6 +5184,7 @@ class DeepseekV41Block(DeepseekV41HyperConnections):
         self.layer_id = policy.layer_id
         self.attn = DeepseekV41Attention(config, policy)
         self.ffn = DeepseekV41MoE(config, vision_enabled=vision_on)
+        self.ffn.layer_id = policy.layer_id
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.engram: Optional[DeepseekV41Engram] = None
