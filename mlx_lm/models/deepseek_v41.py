@@ -2580,6 +2580,8 @@ class DeepseekV41PackedLinear(nn.Module):
                 f"expected a trailing dimension of {self.in_features}, got shape "
                 f"{x.shape}"
             )
+        if self.quant is not None:
+            x = act_quant_roundtrip(x, FP8_ACT_BLOCK_SIZE)
         return x.astype(mx.float32) @ self.dequantized().T
 
 

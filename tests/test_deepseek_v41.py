@@ -2073,17 +2073,19 @@ class TestDeepseekV41PackedExperts(unittest.TestCase):
         self.assertNotIn("scale", dict(lin.parameters()))
         self.assertEqual(lin.weight.dtype, mx.bfloat16)
 
-    def test_dequantization_matches_the_retained_block_primitive(self):
+    def test_packed_linear_quantizes_activations_before_matmul(self):
         mx.random.seed(31)
-        lin = _fill_packed(DeepseekV41PackedLinear(64, 32, "fp4"))
-        expected = dequantize_fp4_block(
-            lin.weight, lin.scale, FP4_WEIGHT_BLOCK_SIZE, mx.float32
-        )
-        self.assertTrue(mx.allclose(lin.dequantized(), expected, atol=0).item())
-        x = mx.random.normal((3, 64))
-        self.assertTrue(
-            mx.allclose(lin(x), x.astype(mx.float32) @ expected.T, atol=1e-4).item()
-        )
+        x = mx.linspace(-9.75, 11.25, 192).reshape(3, 64)
+        for quant in ("fp4", "fp8"):
+            with self.subTest(quant=quant):
+                lin = _fill_packed(DeepseekV41PackedLinear(64, 32, quant))
+                expected_weight = lin.dequantized()
+                expected_input = act_quant_roundtrip(x)
+                expected = expected_input.astype(mx.float32) @ expected_weight.T
+                unquantized = x.astype(mx.float32) @ expected_weight.T
+
+                self.assertFalse(mx.allclose(expected, unquantized, atol=1e-5).item())
+                self.assertTrue(mx.allclose(lin(x), expected, atol=1e-4).item())
 
     def test_a_forward_pass_never_persists_an_unpacked_weight(self):
         # The whole reason the experts are stored packed: a persistent unpack
