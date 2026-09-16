@@ -834,10 +834,31 @@ class TestDeepseekV41CacheOwnership(unittest.TestCase):
         self.assertIsNone(caches[20].pool_state)
         self.assertIsNone(caches[21].pool_state)
 
-    def test_prompt_cache_state_is_refused_rather_than_silently_unshared(self):
+    def test_prompt_cache_state_can_be_materialized_without_unsharing_owners(self):
+        caches = make_deepseek_v41_attention_caches(_official_text_config())
+        caches[0].window = mx.ones((1, 1, caches[0].head_dim))
+        caches[2].compress_kv_writer.write(
+            mx.ones((1, 1, caches[2].head_dim)), 0
+        )
+
+        states = [cache.state for cache in caches]
+        mx.eval(states)
+
+        self.assertIs(states[0][0], caches[0].window)
+        self.assertEqual(
+            sum(
+                caches[2].compress_kv_writer.buffer is value
+                for state in states
+                for value in state
+            ),
+            1,
+        )
+        self.assertIs(caches[3].compress_kv_owner, caches[2].compress_kv_writer)
+
+    def test_prompt_cache_persistence_is_refused_rather_than_silently_unshared(self):
         cache = make_deepseek_v41_attention_caches(_official_text_config())[3]
         with self.assertRaises(NotImplementedError):
-            _ = cache.state
+            _ = cache.meta_state
 
     def test_malformed_config_is_rejected_at_cache_construction(self):
         with self.assertRaises(ValueError):

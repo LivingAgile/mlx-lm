@@ -1437,18 +1437,30 @@ class DeepseekV41AttentionCache(_BaseCache):
 
     @property
     def state(self):
-        raise NotImplementedError(
-            "deepseek_v41 attention caches cannot round-trip through the flat "
-            "per-layer prompt-cache state protocol yet: four physical CED buffers "
-            "are shared by reference across 40 layers, so saving them per layer "
-            "would either duplicate them or silently unshare them on load. "
-            "Prompt-cache save/load for this architecture is deferred."
-        )
+        arrays = []
+        if self.window is not None:
+            arrays.append(self.window)
+        if self.compress_kv_writer is not None:
+            if self.compress_kv_writer.buffer is not None:
+                arrays.append(self.compress_kv_writer.buffer)
+        if self.index_key_writer is not None:
+            if self.index_key_writer.buffer is not None:
+                arrays.append(self.index_key_writer.buffer)
+        if self.pool_state is not None and self.pool_state.kv is not None:
+            arrays.extend((self.pool_state.kv, self.pool_state.score))
+        return tuple(arrays)
 
     @state.setter
     def state(self, v):
         raise NotImplementedError(
             "deepseek_v41 attention cache state cannot be restored; see the getter"
+        )
+
+    @property
+    def meta_state(self):
+        raise NotImplementedError(
+            "deepseek_v41 prompt-cache persistence is unsupported because its "
+            "physical CED buffers are shared across layer cache handles"
         )
 
     def enter(self, start_pos: int, seqlen: int) -> None:
