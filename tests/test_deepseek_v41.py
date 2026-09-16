@@ -49,6 +49,7 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -2693,6 +2694,90 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
 
         self.assertEqual(lookup, [0, 0, 1, 0, 0, 0])
         self.assertEqual(size, 2)
+
+    def test_tokenizer_extension_rejects_every_unproven_shape(self):
+        class _Backend:
+            def __init__(self, tokens):
+                self.tokens = tokens
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                if skip_special_tokens:
+                    raise AssertionError("special tokens must remain visible")
+                return self.tokens[token_ids[0]]
+
+            def id_to_token(self, token_id):
+                return self.tokens[token_id]
+
+        class _Tokenizer:
+            def __init__(self, tokens):
+                self.backend_tokenizer = _Backend(tokens)
+
+            def __len__(self):
+                return len(self.backend_tokenizer.tokens)
+
+        cases = (
+            (
+                ["a", "b"],
+                {"expected_size": 3, "fallback_token_id": 0},
+                "checkpoint config requires 3",
+            ),
+            (
+                ["a", "b", "<|place_holder_mm_span_0036|>", "a", "<|place_holder_mm_span_0037|>"],
+                {"expected_size": 2, "fallback_token_id": 0},
+                "contiguous suffix",
+            ),
+            (
+                ["a", "b", "<|unknown_multimodal_token|>"],
+                {"expected_size": 2, "fallback_token_id": 0},
+                "contiguous suffix",
+            ),
+            (
+                ["a", "b", "<|place_holder_mm_span_0036|>"],
+                {"expected_size": 2, "fallback_token_id": 3},
+                "outside tokenizer vocabulary",
+            ),
+        )
+        for tokens, kwargs, message in cases:
+            with self.subTest(tokens=tokens), self.assertRaisesRegex(ValueError, message):
+                build_engram_compressed_token_map_from_tokenizer(
+                    _Tokenizer(tokens), **kwargs
+                )
+
+    def test_model_binding_passes_checkpoint_size_and_compressed_pad_id(self):
+        class _Backend:
+            tokens = ["A", "a", "b", "<|place_holder_mm_span_0036|>"]
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                if skip_special_tokens:
+                    raise AssertionError("special tokens must remain visible")
+                return self.tokens[token_ids[0]]
+
+            def id_to_token(self, token_id):
+                return self.tokens[token_id]
+
+        class _Tokenizer:
+            backend_tokenizer = _Backend()
+
+            def __len__(self):
+                return len(self.backend_tokenizer.tokens)
+
+        config = _engram_text_config(
+            engram_compressed_vocab_size=2,
+            engram_pad_token_id=1,
+        )
+        runtime = SimpleNamespace(
+            engram_layout=EngramLayout.from_config(config),
+            bind_engram_hasher=lambda hasher: setattr(runtime, "hasher", hasher),
+        )
+        model = SimpleNamespace(
+            _runtime=runtime,
+            args=SimpleNamespace(text_config=config),
+        )
+
+        Model.bind_tokenizer(model, _Tokenizer())
+
+        self.assertEqual(runtime.hasher.compressed_vocab_size, 2)
+        self.assertEqual(runtime.hasher.token_map.tolist(), [0, 0, 1, 0])
 
 
 class TestDeepseekV41EngramLayout(unittest.TestCase):
