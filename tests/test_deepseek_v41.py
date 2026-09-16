@@ -63,6 +63,7 @@ from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.tokenizer_utils import load as load_tokenizer
 from mlx_lm.models.deepseek_v41 import (
     COMPRESS_KV_FP4_BLOCK_SIZE,
+    ENGRAM_DEAD_TOKEN,
     ENGRAM_FP8_BLOCK_SIZE,
     ENGRAM_GATE_CLAMP,
     ENGRAM_NORMALIZER_SEQUENCE,
@@ -4619,6 +4620,11 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
                 input_ids,
                 token_types=mx.array([[-1, IMAGE, -1]], dtype=mx.int32),
             )
+            hasher = model._runtime.engram_hash
+            self.assertIsNotNone(hasher)
+            self.assertFalse(np.all(hasher.cache[0, :3] == ENGRAM_DEAD_TOKEN))
+            model.forward_main(mx.array([[4]], dtype=mx.int32))
+            self.assertTrue(np.all(hasher.cache[0, 1:3] == ENGRAM_DEAD_TOKEN))
             expected_masked = mx.mean(expanded[:, 1:2], axis=2)
             self.assertTrue(
                 mx.allclose(main_hidden[:, 1:2], expected_masked)
