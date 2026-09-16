@@ -3129,43 +3129,48 @@ class TestDeepseekV41EngramRowStore(unittest.TestCase):
 
 
 class TestDeepseekV41QuantizedEngramRowStore(unittest.TestCase):
-    def test_selected_six_bit_rows_match_mlx_dequantize(self):
+    def test_selected_derivative_rows_match_mlx_dequantize(self):
         rng = np.random.default_rng(41)
         dense = mx.array(rng.normal(size=(8, 256)).astype(np.float32))
-        weight, scales, biases = mx.quantize(dense, group_size=64, bits=6)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = _write_quantized_engram_fixture(
-                os.path.join(tmp, "engram6.safetensors"),
-                np.asarray(weight),
-                np.asarray(scales).view(np.uint16),
-                np.asarray(biases).view(np.uint16),
-            )
-            with SafetensorsQuantizedEngramRowStore(path, bits=6) as store:
-                cache = BoundedEngramRowCache(store, max_rows=2)
-                wanted = np.array([7, 1, 7], dtype=np.int64)
-                actual = cache.gather_rows(wanted, dtype=mx.float32)
-                expected = mx.take(
-                    mx.dequantize(
-                        weight, scales, biases, group_size=64, bits=6
-                    ),
-                    mx.array(wanted),
-                    axis=0,
+        for bits in (4, 6):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as tmp:
+                weight, scales, biases = mx.quantize(
+                    dense, group_size=64, bits=bits
                 )
-                self.assertTrue(mx.allclose(actual, expected))
-                self.assertEqual(store.rows_read, 2)
-                self.assertEqual(store.bytes_read, 2 * store.row_nbytes)
-                self.assertEqual(cache.nbytes(), 2 * store.row_nbytes)
+                path = _write_quantized_engram_fixture(
+                    os.path.join(tmp, f"engram{bits}.safetensors"),
+                    np.asarray(weight),
+                    np.asarray(scales).view(np.uint16),
+                    np.asarray(biases).view(np.uint16),
+                )
+                with SafetensorsQuantizedEngramRowStore(path, bits=bits) as store:
+                    cache = BoundedEngramRowCache(store, max_rows=2)
+                    wanted = np.array([7, 1, 7], dtype=np.int64)
+                    actual = cache.gather_rows(wanted, dtype=mx.float32)
+                    expected = mx.take(
+                        mx.dequantize(
+                            weight, scales, biases, group_size=64, bits=bits
+                        ),
+                        mx.array(wanted),
+                        axis=0,
+                    )
+                    self.assertTrue(mx.allclose(actual, expected))
+                    self.assertEqual(store.rows_read, 2)
+                    self.assertEqual(store.bytes_read, 2 * store.row_nbytes)
+                    self.assertEqual(cache.nbytes(), 2 * store.row_nbytes)
 
-    def test_six_bit_geometry_is_validated_before_any_row_read(self):
-        weight = np.zeros((2, 47), dtype=np.uint32)
+    def test_derivative_geometry_is_validated_before_any_row_read(self):
         scales = np.zeros((2, 4), dtype=np.uint16)
         biases = np.zeros((2, 4), dtype=np.uint16)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = _write_quantized_engram_fixture(
-                os.path.join(tmp, "bad.safetensors"), weight, scales, biases
-            )
-            with self.assertRaisesRegex(ValueError, "require 48"):
-                SafetensorsQuantizedEngramRowStore(path, bits=6)
+        for bits, packed_words in ((4, 31), (6, 47)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as tmp:
+                weight = np.zeros((2, packed_words), dtype=np.uint32)
+                path = _write_quantized_engram_fixture(
+                    os.path.join(tmp, "bad.safetensors"), weight, scales, biases
+                )
+                expected_words = 4 * bits * 64 // 32
+                with self.assertRaisesRegex(ValueError, f"require {expected_words}"):
+                    SafetensorsQuantizedEngramRowStore(path, bits=bits)
 
 
 class TestDeepseekV41DerivativeProfile(unittest.TestCase):
@@ -3222,41 +3227,43 @@ class TestDeepseekV41DerivativeProfile(unittest.TestCase):
             ModelArgs.from_dict(official)
 
     def test_derivative_engram_loader_claims_all_three_quantized_leaves(self):
-        config = self._config()
-        text = config["text_config"] | {
-            "engram_layer_ids": [0],
-            "engram_num_embeddings": [408],
-            "engram_max_ngram_size": 3,
-            "engram_vocab_size": 97,
-            "engram_n_heads": 2,
-            "engram_head_dim": 256,
-            "engram_pad_token_id": 2,
-            "engram_compressed_vocab_size": 11,
-        }
-        config["text_config"] = text
-        model = Model(ModelArgs.from_dict(config))
         dense = mx.zeros((408, 256), dtype=mx.float32)
-        weight, scales, biases = mx.quantize(dense, group_size=64, bits=6)
         prefix = "layers.0.engram.embed."
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "model-layers-00-engram.safetensors"
-            _write_quantized_engram_fixture(
-                path,
-                np.asarray(weight),
-                np.asarray(scales).view(np.uint16),
-                np.asarray(biases).view(np.uint16),
-                prefix=prefix,
-            )
-            excluded = model.prepare_file_backed_weights(Path(tmp), [path])
-            self.assertEqual(
-                excluded[str(path.resolve())],
-                {prefix + "weight", prefix + "scales", prefix + "biases"},
-            )
-            store = model.layers[0].engram.embed.cache.store
-            self.assertIsInstance(store, SafetensorsQuantizedEngramRowStore)
-            self.assertEqual((store.bits, store.group_size), (6, 64))
-            self.assertEqual(store.bytes_read, 0)
-            store.close()
+        for bits in (4, 6):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as tmp:
+                config = self._config(bits)
+                config["text_config"] = config["text_config"] | {
+                    "engram_layer_ids": [0],
+                    "engram_num_embeddings": [408],
+                    "engram_max_ngram_size": 3,
+                    "engram_vocab_size": 97,
+                    "engram_n_heads": 2,
+                    "engram_head_dim": 256,
+                    "engram_pad_token_id": 2,
+                    "engram_compressed_vocab_size": 11,
+                }
+                model = Model(ModelArgs.from_dict(config))
+                weight, scales, biases = mx.quantize(
+                    dense, group_size=64, bits=bits
+                )
+                path = Path(tmp) / "model-layers-00-engram.safetensors"
+                _write_quantized_engram_fixture(
+                    path,
+                    np.asarray(weight),
+                    np.asarray(scales).view(np.uint16),
+                    np.asarray(biases).view(np.uint16),
+                    prefix=prefix,
+                )
+                excluded = model.prepare_file_backed_weights(Path(tmp), [path])
+                self.assertEqual(
+                    excluded[str(path.resolve())],
+                    {prefix + "weight", prefix + "scales", prefix + "biases"},
+                )
+                store = model.layers[0].engram.embed.cache.store
+                self.assertIsInstance(store, SafetensorsQuantizedEngramRowStore)
+                self.assertEqual((store.bits, store.group_size), (bits, 64))
+                self.assertEqual(store.bytes_read, 0)
+                store.close()
 
     def test_derivative_sanitize_does_not_apply_official_wo_a_rules(self):
         model = Model(ModelArgs.from_dict(self._config()))
