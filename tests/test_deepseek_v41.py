@@ -2595,6 +2595,13 @@ def _write_quantized_engram_fixture(
     return path
 
 
+def _float32_to_bfloat16_bits(values):
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    bits = values.view(np.uint32)
+    rounding_bias = np.uint32(0x7FFF) + ((bits >> 16) & 1)
+    return ((bits + rounding_bias) >> 16).astype(np.uint16)
+
+
 def _random_engram_shard(n_rows, dim, block_size, seed):
     """Packed bytes for a tiny Engram shard: E4M3 values plus E8M0 row scales.
 
@@ -3137,11 +3144,13 @@ class TestDeepseekV41QuantizedEngramRowStore(unittest.TestCase):
                 weight, scales, biases = mx.quantize(
                     dense, group_size=64, bits=bits
                 )
+                scale_bits = _float32_to_bfloat16_bits(np.asarray(scales))
+                bias_bits = _float32_to_bfloat16_bits(np.asarray(biases))
                 path = _write_quantized_engram_fixture(
                     os.path.join(tmp, f"engram{bits}.safetensors"),
                     np.asarray(weight),
-                    np.asarray(scales).view(np.uint16),
-                    np.asarray(biases).view(np.uint16),
+                    scale_bits,
+                    bias_bits,
                 )
                 with SafetensorsQuantizedEngramRowStore(path, bits=bits) as store:
                     cache = BoundedEngramRowCache(store, max_rows=2)
@@ -3149,7 +3158,11 @@ class TestDeepseekV41QuantizedEngramRowStore(unittest.TestCase):
                     actual = cache.gather_rows(wanted, dtype=mx.float32)
                     expected = mx.take(
                         mx.dequantize(
-                            weight, scales, biases, group_size=64, bits=bits
+                            weight,
+                            mx.array(scale_bits).view(mx.bfloat16),
+                            mx.array(bias_bits).view(mx.bfloat16),
+                            group_size=64,
+                            bits=bits,
                         ),
                         mx.array(wanted),
                         axis=0,
@@ -3250,8 +3263,8 @@ class TestDeepseekV41DerivativeProfile(unittest.TestCase):
                 _write_quantized_engram_fixture(
                     path,
                     np.asarray(weight),
-                    np.asarray(scales).view(np.uint16),
-                    np.asarray(biases).view(np.uint16),
+                    _float32_to_bfloat16_bits(np.asarray(scales)),
+                    _float32_to_bfloat16_bits(np.asarray(biases)),
                     prefix=prefix,
                 )
                 excluded = model.prepare_file_backed_weights(Path(tmp), [path])
