@@ -1630,7 +1630,6 @@ class DeepseekV41Indexer(nn.Module):
         self.wq_b = _make_fp8_linear(
             config.q_lora_rank,
             config.index_n_heads * config.index_head_dim,
-            quant="fp8",
         )
         self.weights_proj = nn.Linear(
             config.hidden_size, config.index_n_heads, bias=False
@@ -1744,18 +1743,13 @@ class DeepseekV41Attention(nn.Module):
         self.softmax_scale = config.head_dim**-0.5
 
         self.attn_sink = mx.zeros((config.num_attention_heads,), dtype=mx.float32)
-        self.wq_a = _make_fp8_linear(
-            config.hidden_size, config.q_lora_rank, quant="fp8"
-        )
+        self.wq_a = _make_fp8_linear(config.hidden_size, config.q_lora_rank)
         self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = _make_fp8_linear(
             config.q_lora_rank,
             config.num_attention_heads * config.head_dim,
-            quant="fp8",
         )
-        self.wkv = _make_fp8_linear(
-            config.hidden_size, config.head_dim, quant="fp8"
-        )
+        self.wkv = _make_fp8_linear(config.hidden_size, config.head_dim)
         self.kv_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         # Block diagonal over o_groups: each group sees only its own heads.
         self.wo_a = nn.Linear(
@@ -1766,7 +1760,6 @@ class DeepseekV41Attention(nn.Module):
         self.wo_b = _make_fp8_linear(
             config.o_groups * config.o_lora_rank,
             config.hidden_size,
-            quant="fp8",
         )
         if policy.is_kv_source:
             self.compressor = DeepseekV41Compressor(config, policy.compress_ratio)
@@ -4395,7 +4388,6 @@ class DeepseekV41Engram(nn.Module):
         self.wkv = _make_fp8_linear(
             self.n_hash_cols * layout.head_dim,
             self.dim * (self.hc_mult + 1),
-            quant="fp8",
         )
         self.q_weight = mx.ones((self.hc_mult, self.dim))
         self.k_weight = mx.ones((self.hc_mult, self.dim))
