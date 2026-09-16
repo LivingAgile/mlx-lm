@@ -118,6 +118,7 @@ from .cache import _BaseCache
 
 
 _DIAGNOSTIC_ENV = "MLX_LM_DEEPSEEK_V41_TRACE"
+_DIAGNOSTIC_START_ENV = "MLX_LM_DEEPSEEK_V41_TRACE_START"
 
 
 def _diagnostic_trace(event: str, **fields) -> None:
@@ -5393,19 +5394,23 @@ class DeepseekV41Transformer(nn.Module):
         hidden = hc_pre(hidden, pre_mix)
         normalized_hidden = self.norm(hidden)
         logits = self.head(normalized_hidden, full_logits=True)
-        if os.environ.get(_DIAGNOSTIC_ENV) == "1" and start_pos == 0:
+        trace_enabled = os.environ.get(_DIAGNOSTIC_ENV) == "1"
+        if trace_enabled and start_pos == 0:
             self._diagnostic_calls = 0
-        if (
-            os.environ.get(_DIAGNOSTIC_ENV) == "1"
-            and self._diagnostic_calls < 17
-        ):
+        trace_call = self._diagnostic_calls
+        if trace_enabled:
+            self._diagnostic_calls += 1
+        trace_start = (
+            int(os.environ.get(_DIAGNOSTIC_START_ENV, "0")) if trace_enabled else 0
+        )
+        if trace_enabled and trace_start <= trace_call < trace_start + 17:
             last_logits = np.asarray(logits[0, -1].astype(mx.float32))
             top_count = min(5, last_logits.size)
             top_ids = np.argpartition(-last_logits, top_count - 1)[:top_count]
             top_ids = top_ids[np.argsort(-last_logits[top_ids])]
             _diagnostic_trace(
                 "model_output",
-                call=self._diagnostic_calls,
+                call=trace_call,
                 start_pos=start_pos,
                 input_shape=list(input_ids.shape),
                 input_tail=np.asarray(input_ids).reshape(-1)[-16:].tolist(),
@@ -5417,7 +5422,6 @@ class DeepseekV41Transformer(nn.Module):
                 top_ids=top_ids.tolist(),
                 top_logits=last_logits[top_ids].tolist(),
             )
-            self._diagnostic_calls += 1
         main_hidden = (
             mx.concatenate(main_hiddens, axis=-1) if main_hiddens else None
         )

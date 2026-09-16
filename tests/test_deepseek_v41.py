@@ -4322,17 +4322,25 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
         model.embed.weight = mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
         model.head.weight = mx.eye(64, 32, dtype=mx.float32)
         prior = os.environ.get("MLX_LM_DEEPSEEK_V41_TRACE")
+        prior_start = os.environ.get("MLX_LM_DEEPSEEK_V41_TRACE_START")
         os.environ["MLX_LM_DEEPSEEK_V41_TRACE"] = "1"
+        os.environ["MLX_LM_DEEPSEEK_V41_TRACE_START"] = "1"
         trace = StringIO()
         try:
             with redirect_stderr(trace):
-                model(mx.array([[1, 2, 3]], dtype=mx.int32))
-                model(mx.array([[1, 2, 3]], dtype=mx.int32))
+                for _ in range(2):
+                    cache = model.make_cache()
+                    model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+                    model(mx.array([[4]], dtype=mx.int32), cache=cache)
         finally:
             if prior is None:
                 os.environ.pop("MLX_LM_DEEPSEEK_V41_TRACE", None)
             else:
                 os.environ["MLX_LM_DEEPSEEK_V41_TRACE"] = prior
+            if prior_start is None:
+                os.environ.pop("MLX_LM_DEEPSEEK_V41_TRACE_START", None)
+            else:
+                os.environ["MLX_LM_DEEPSEEK_V41_TRACE_START"] = prior_start
 
         events = [
             json.loads(line.removeprefix("DEEPSEEK_V41_TRACE "))
@@ -4340,13 +4348,12 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             if '"event": "model_output"' in line
         ]
         self.assertEqual(len(events), 2)
+        self.assertEqual([event["call"] for event in events], [1, 1])
         event = events[0]
-        self.assertEqual(event["call"], 0)
-        self.assertEqual(events[1]["call"], 0)
-        self.assertEqual(event["start_pos"], 0)
-        self.assertEqual(event["input_shape"], [1, 3])
-        self.assertEqual(event["input_tail"], [1, 2, 3])
-        self.assertEqual(event["cache_offset"], 3)
+        self.assertEqual(event["start_pos"], 3)
+        self.assertEqual(event["input_shape"], [1, 1])
+        self.assertEqual(event["input_tail"], [4])
+        self.assertEqual(event["cache_offset"], 4)
         self.assertEqual(event["finite_logits"], 64)
         self.assertEqual(event["vocab_size"], 64)
         self.assertEqual(len(event["top_ids"]), 5)
