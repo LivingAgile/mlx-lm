@@ -136,6 +136,29 @@ def _diagnostic_norm(value: mx.array) -> float:
     return float(np.linalg.norm(array.reshape(-1)))
 
 
+def _diagnostic_token_cosines(
+    value: mx.array,
+) -> Dict[str, Union[int, float]]:
+    tokens = np.asarray(value.astype(mx.float32)).reshape(-1, value.shape[-1])
+    if tokens.shape[0] < 2:
+        return {"token_pairs": 0}
+    norms = np.linalg.norm(tokens, axis=-1, keepdims=True)
+    normalized = tokens / np.maximum(norms, np.finfo(np.float32).tiny)
+    similarities = normalized @ normalized.T
+    pairs = similarities[np.triu_indices(tokens.shape[0], k=1)]
+    adjacent = np.sum(normalized[:-1] * normalized[1:], axis=-1)
+    return {
+        "token_pairs": int(pairs.size),
+        "token_cosine_mean": float(np.mean(pairs)),
+        "token_cosine_min": float(np.min(pairs)),
+        "token_cosine_max": float(np.max(pairs)),
+        "token_cosine_ge_099": float(np.mean(pairs >= 0.99)),
+        "token_cosine_ge_0999": float(np.mean(pairs >= 0.999)),
+        "adjacent_cosine_mean": float(np.mean(adjacent)),
+        "adjacent_cosine_max": float(np.max(adjacent)),
+    }
+
+
 @dataclass
 class VisionConfig(BaseModelArgs):
     model_type: str
@@ -2893,6 +2916,7 @@ class DeepseekV41MoE(nn.Module):
         )
         if trace:
             input_norm = _diagnostic_norm(flat)
+            input_cosines = _diagnostic_token_cosines(flat)
             local_y_norm = _diagnostic_norm(y)
         if self.world_size > 1:
             y = self.all_reduce(y)
@@ -2918,6 +2942,7 @@ class DeepseekV41MoE(nn.Module):
                 expert_start=self.experts_start_idx,
                 expert_end=self.experts_end_idx,
                 input_norm=input_norm,
+                **input_cosines,
                 local_routed_norm=local_y_norm,
                 reduced_routed_norm=_diagnostic_norm(y),
                 shared_norm=_diagnostic_norm(shared),
