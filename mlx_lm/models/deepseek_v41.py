@@ -5258,12 +5258,32 @@ class DeepseekV41Block(DeepseekV41HyperConnections):
             lambda value: self.attn(self.attn_norm(value), cache),
             "attn",
         )
-        return self.sublayer_step(
+        trace_call = getattr(self, "_diagnostic_trace_call", None)
+        if trace_call is not None:
+            _diagnostic_trace(
+                "sublayer_boundary",
+                call=trace_call,
+                layer=self.layer_id,
+                stage="attn",
+                hidden_norm=_diagnostic_norm(x),
+                pre_mix_norm=_diagnostic_norm(attn_pre),
+            )
+        x, ffn_pre = self.sublayer_step(
             x,
             attn_pre,
             lambda value: self.ffn(self.ffn_norm(value), image_mask),
             "ffn",
         )
+        if trace_call is not None:
+            _diagnostic_trace(
+                "sublayer_boundary",
+                call=trace_call,
+                layer=self.layer_id,
+                stage="ffn",
+                hidden_norm=_diagnostic_norm(x),
+                pre_mix_norm=_diagnostic_norm(ffn_pre),
+            )
+        return x, ffn_pre
 
 
 class DeepseekV41Transformer(nn.Module):
@@ -5421,6 +5441,7 @@ class DeepseekV41Transformer(nn.Module):
             hidden = layer.inject_engram(hidden, layer_hashes, engram_mask)
             if layer_id in self.target_layer_ids:
                 main_hiddens.append(mx.mean(hidden, axis=2))
+            layer._diagnostic_trace_call = trace_call if trace_layers else None
             hidden, pre_mix = layer(hidden, pre_mix, layer_cache, image_mask)
             if trace_layers:
                 _diagnostic_trace(
