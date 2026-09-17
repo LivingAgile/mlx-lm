@@ -4370,7 +4370,7 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
         self.assertEqual([event["call"] for event in events], [1, 1])
         self.assertEqual(
             [event["call"] for event in moe_events],
-            [0, 0, 1, 1, 0, 0, 1, 1],
+            [1, 1, 1, 1],
         )
         event = events[0]
         self.assertEqual(event["start_pos"], 3)

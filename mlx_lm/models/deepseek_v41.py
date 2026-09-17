@@ -2929,18 +2929,21 @@ class DeepseekV41MoE(nn.Module):
             )
             y[tokens] = y[tokens] + out.astype(mx.float32)
 
-        trace = (
-            os.environ.get(_DIAGNOSTIC_ENV) == "1"
-            and self._diagnostic_calls < 17
+        trace_enabled = os.environ.get(_DIAGNOSTIC_ENV) == "1"
+        trace_call = self._diagnostic_calls
+        trace_start = (
+            int(os.environ.get(_DIAGNOSTIC_START_ENV, "0")) if trace_enabled else 0
         )
-        if trace:
-            input_norm = _diagnostic_norm(flat)
-            input_cosines = _diagnostic_token_cosines(flat)
+        trace = trace_enabled and trace_start <= trace_call < trace_start + 17
+        if trace_enabled:
             previous_token_cosine, self._diagnostic_previous_input = (
                 _diagnostic_previous_token_cosine(
                     flat, self._diagnostic_previous_input
                 )
             )
+        if trace:
+            input_norm = _diagnostic_norm(flat)
+            input_cosines = _diagnostic_token_cosines(flat)
             local_y_norm = _diagnostic_norm(y)
         if self.world_size > 1:
             y = self.all_reduce(y)
@@ -2973,6 +2976,7 @@ class DeepseekV41MoE(nn.Module):
                 reduced_routed_norm=_diagnostic_norm(y),
                 shared_norm=_diagnostic_norm(shared),
             )
+        if trace_enabled:
             self._diagnostic_calls += 1
         y = y + shared
         return y.astype(x.dtype).reshape(shape)
