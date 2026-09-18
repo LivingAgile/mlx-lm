@@ -4421,9 +4421,22 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as model_directory:
             model_path = Path(model_directory)
-            (model_path / "config.json").write_text(json.dumps(config))
             weights = dict(tree_flatten(model.parameters()))
             if publisher_layout:
+                embedding_parts = mx.quantize(model.embed.weight, group_size=64, bits=8)
+                for leaf, value in zip(("weight", "scales", "biases"), embedding_parts):
+                    weights[f"embed.{leaf}"] = value
+                config["quantization"].setdefault("modules", {})["embed"] = {
+                    "group_size": 64,
+                    "bits": 8,
+                }
+                head_parts = mx.quantize(model.head.weight, group_size=64, bits=8)
+                for leaf, value in zip(("weight", "scales", "biases"), head_parts):
+                    weights[f"head.{leaf}"] = value
+                config["quantization"]["modules"]["head"] = {
+                    "group_size": 64,
+                    "bits": 8,
+                }
                 for layer_id, layer in enumerate(model.layers):
                     for projection, checkpoint_name in (
                         ("w1", "gate_proj"),
@@ -4440,11 +4453,39 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
                                     for expert_id in range(len(layer.ffn.experts))
                                 ]
                             )
+            (model_path / "config.json").write_text(json.dumps(config))
             mx.save_safetensors(
                 str(model_path / "model.safetensors"),
                 weights,
             )
             loaded, _ = load_model(model_path, strict=True)
+            if publisher_layout:
+                self.assertEqual(loaded.embed.bits, 8)
+                expected_embedding = mx.dequantize(
+                    *embedding_parts, group_size=64, bits=8
+                )
+                self.assertTrue(
+                    mx.allclose(
+                        loaded.embed(mx.array([[1, 2, 3]])),
+                        expected_embedding[mx.array([[1, 2, 3]])],
+                    )
+                )
+                self.assertEqual(loaded.head.bits, 8)
+                head_input = mx.arange(128, dtype=mx.float32).reshape(1, 2, 64) / 128
+                expected_head = (
+                    head_input @ mx.dequantize(*head_parts, group_size=64, bits=8).T
+                )
+                self.assertTrue(
+                    mx.allclose(
+                        loaded.head(head_input, full_logits=True), expected_head
+                    )
+                )
+                self.assertTrue(
+                    mx.allclose(loaded.head(head_input), expected_head[:, -1])
+                )
+                for invalid_id in (-1, 64):
+                    with self.assertRaisesRegex(ValueError, "token id is outside"):
+                        loaded.embed(mx.array([[invalid_id]]))
             self.assertEqual(loaded.layers[0].ffn.experts[0].w1.bits, 4)
             self.assertEqual(loaded.layers[0].attn.wq_a.bits, 8)
             cache = loaded.make_cache()

@@ -2947,10 +2947,31 @@ class DeepseekV41DSparkEmbedding(nn.Module):
         self.dim = dim
         self.weight = mx.zeros((vocab_size, dim), dtype=mx.bfloat16)
 
+    def to_quantized(self, group_size=64, bits=8, mode="affine"):
+        self.weight, self.scales, *biases = mx.quantize(
+            self.weight, group_size=group_size, bits=bits, mode=mode
+        )
+        self.biases = biases[0] if biases else None
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self.freeze()
+        return self
+
     def __call__(self, token_ids: mx.array) -> mx.array:
         ids = np.asarray(token_ids)
         if ids.size and (ids.min() < 0 or ids.max() >= self.vocab_size):
             raise ValueError(f"token id is outside [0, {self.vocab_size})")
+        if "scales" in self:
+            indices = token_ids.astype(mx.int32)
+            return mx.dequantize(
+                self.weight[indices],
+                self.scales[indices],
+                self.biases[indices] if self.biases is not None else None,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+            )
         return mx.take(self.weight, token_ids.astype(mx.int32), axis=0)
 
 
@@ -2961,6 +2982,17 @@ class DeepseekV41DSparkHead(nn.Module):
         self.dim = dim
         self.weight = mx.zeros((vocab_size, dim), dtype=mx.float32)
 
+    def to_quantized(self, group_size=64, bits=8, mode="affine"):
+        self.weight, self.scales, *biases = mx.quantize(
+            self.weight, group_size=group_size, bits=bits, mode=mode
+        )
+        self.biases = biases[0] if biases else None
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self.freeze()
+        return self
+
     def __call__(self, x: mx.array, full_logits: bool = False) -> mx.array:
         if x.shape[-1] != self.dim:
             raise ValueError(
@@ -2968,6 +3000,17 @@ class DeepseekV41DSparkHead(nn.Module):
             )
         if not full_logits:
             x = x[:, -1]
+        if "scales" in self:
+            return mx.quantized_matmul(
+                x.astype(mx.float32),
+                self.weight,
+                self.scales,
+                self.biases,
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+            )
         return x.astype(mx.float32) @ self.weight.T
 
 
