@@ -90,7 +90,7 @@ compressed vocabulary exactly.
 import json
 import math
 import re
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -1464,12 +1464,86 @@ class DeepseekV41AttentionCache(_BaseCache):
             if policy.is_kv_source and policy.compress_ratio > 1
             else None
         )
+        self._rollback = deque(maxlen=2)
 
     def size(self) -> int:
         return self.offset
 
     def empty(self) -> bool:
         return self.offset == 0
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def begin_update(self) -> None:
+        self._rollback.append(
+            (
+                self.offset,
+                None if self.window is None else mx.array(self.window),
+                (
+                    None
+                    if self.pool_state is None or self.pool_state.kv is None
+                    else mx.array(self.pool_state.kv)
+                ),
+                (
+                    None
+                    if self.pool_state is None or self.pool_state.score is None
+                    else mx.array(self.pool_state.score)
+                ),
+                (
+                    None
+                    if self.compress_kv_writer is None
+                    else self.compress_kv_writer.length
+                ),
+                None if self.index_key_writer is None else self.index_key_writer.length,
+            )
+        )
+
+    def trim(self, count: int) -> int:
+        count = min(self.offset, count)
+        target = self.offset - count
+        snapshot = next((entry for entry in self._rollback if entry[0] == target), None)
+        if snapshot is None:
+            raise ValueError(
+                "deepseek_v41 cache can only trim the last two single-token updates; "
+                f"cannot roll layer {self.layer_id} back from {self.offset} to {target}"
+            )
+        _, window, pool_kv, pool_score, compress_len, index_len = snapshot
+        self.offset = target
+        self.window = window
+        if self.pool_state is not None:
+            self.pool_state.kv = pool_kv
+            self.pool_state.score = pool_score
+        if self.compress_kv_writer is not None:
+            self.compress_kv_writer.length = compress_len
+        if self.index_key_writer is not None:
+            self.index_key_writer.length = index_len
+        while self._rollback and self._rollback[-1][0] >= target:
+            self._rollback.pop()
+        return count
+
+    @classmethod
+    def merge(cls, caches):
+        if len(caches) != 1:
+            raise ValueError(
+                "deepseek_v41 attention caches currently support one active "
+                f"sequence per batch, got {len(caches)}"
+            )
+        return caches[0]
+
+    def extract(self, index):
+        if index != 0:
+            raise IndexError(
+                "deepseek_v41 singleton attention cache only has batch index 0"
+            )
+        return self
+
+    def filter(self, batch_indices):
+        if list(batch_indices) != [0]:
+            raise ValueError(
+                "deepseek_v41 attention caches currently support retaining only "
+                f"the singleton batch index, got {list(batch_indices)}"
+            )
 
     @property
     def nbytes(self) -> int:
@@ -1486,18 +1560,31 @@ class DeepseekV41AttentionCache(_BaseCache):
 
     @property
     def state(self):
-        raise NotImplementedError(
-            "deepseek_v41 attention caches cannot round-trip through the flat "
-            "per-layer prompt-cache state protocol yet: four physical CED buffers "
-            "are shared by reference across 40 layers, so saving them per layer "
-            "would either duplicate them or silently unshare them on load. "
-            "Prompt-cache save/load for this architecture is deferred."
-        )
+        arrays = []
+        if self.window is not None:
+            arrays.append(self.window)
+        if self.compress_kv_writer is not None:
+            if self.compress_kv_writer.buffer is not None:
+                arrays.append(self.compress_kv_writer.buffer)
+        if self.index_key_writer is not None:
+            if self.index_key_writer.buffer is not None:
+                arrays.append(self.index_key_writer.buffer)
+        if self.pool_state is not None and self.pool_state.kv is not None:
+            arrays.extend((self.pool_state.kv, self.pool_state.score))
+        return tuple(arrays)
 
     @state.setter
     def state(self, v):
         raise NotImplementedError(
-            "deepseek_v41 attention cache state cannot be restored; see the getter"
+            "deepseek_v41 shared attention cache state cannot be restored "
+            "through the flat per-layer prompt-cache protocol"
+        )
+
+    @property
+    def meta_state(self):
+        raise NotImplementedError(
+            "deepseek_v41 prompt-cache persistence is unsupported because its "
+            "physical CED buffers are shared across layer cache handles"
         )
 
     def enter(self, start_pos: int, seqlen: int) -> None:
@@ -1892,6 +1979,7 @@ class DeepseekV41Attention(nn.Module):
             )
         batch, seqlen, _ = x.shape
         start_pos = cache.offset
+        cache.begin_update()
         cache.enter(start_pos, seqlen)
         cos, sin = self.rope(
             mx.arange(start_pos, start_pos + seqlen, dtype=mx.int32)

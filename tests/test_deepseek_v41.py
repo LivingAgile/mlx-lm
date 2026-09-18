@@ -834,10 +834,25 @@ class TestDeepseekV41CacheOwnership(unittest.TestCase):
         self.assertIsNone(caches[20].pool_state)
         self.assertIsNone(caches[21].pool_state)
 
-    def test_prompt_cache_state_is_refused_rather_than_silently_unshared(self):
-        cache = make_deepseek_v41_attention_caches(_official_text_config())[3]
+    def test_prompt_cache_state_evaluates_owned_buffers_but_refuses_restore(self):
+        caches = make_deepseek_v41_attention_caches(_official_text_config())
+        source = caches[2]
+        consumer = caches[3]
+        source.window = mx.zeros((1, 2, 4))
+        source.compress_kv_writer.buffer = mx.ones((1, 2, 4))
+        source.pool_state.kv = mx.ones((1, 1, 4))
+        source.pool_state.score = mx.zeros((1, 1, 4))
+        arrays = source.state
+        mx.eval(arrays)
+        self.assertEqual(len(arrays), 4)
+        self.assertIs(arrays[0], source.window)
+        self.assertIs(arrays[1], source.compress_kv_writer.buffer)
+        self.assertIs(arrays[2], source.pool_state.kv)
+        self.assertIs(arrays[3], source.pool_state.score)
+        self.assertEqual(consumer.state, ())
+        self.assertIs(consumer.compress_kv_owner, source.compress_kv_writer)
         with self.assertRaises(NotImplementedError):
-            _ = cache.state
+            consumer.state = arrays
 
     def test_malformed_config_is_rejected_at_cache_construction(self):
         with self.assertRaises(ValueError):
@@ -1190,6 +1205,26 @@ class TestDeepseekV41AttentionExecution(unittest.TestCase):
                 f"layer {i} (ratio {policy.compress_ratio}) decode diverged "
                 "from the equivalent prefill",
             )
+
+    def test_two_token_rollback_restores_compressed_shared_state(self):
+        config, stack = self._stack()
+        inputs = self._inputs(config, 1, 10)
+        cache = stack.make_cache()
+        stack([inputs[:, :6]] * len(stack.layers), cache)
+        for position in (6, 7):
+            stack([inputs[:, position : position + 1]] * len(stack.layers), cache)
+        for entry in cache:
+            self.assertEqual(entry.trim(2), 2)
+        for position in range(6, 10):
+            resumed = stack(
+                [inputs[:, position : position + 1]] * len(stack.layers), cache
+            )
+        fresh = stack([inputs] * len(stack.layers), stack.make_cache())
+        for resumed_output, fresh_output in zip(resumed, fresh):
+            self.assertTrue(
+                mx.allclose(resumed_output, fresh_output[:, -1:], atol=2e-4)
+            )
+        self.assertIs(cache[3].compress_kv_owner, cache[2].compress_kv_writer)
 
     def test_batched_token_decode_matches_the_equivalent_prefill(self):
         config, stack = self._stack()
@@ -4335,6 +4370,62 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
                 for name, _ in tree_flatten(model.parameters())
             )
         )
+
+    def test_generation_prefill_trim_and_decode_matches_fresh_prompt(self):
+        from mlx_lm.generate import generate_step
+
+        model = Model(self._args())
+        model.embed.weight = mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
+        model.head.weight = mx.eye(64, 32, dtype=mx.float32)
+        prompt = mx.array([1, 2, 3, 4, 5, 6], dtype=mx.int32)
+        cache = model.make_cache()
+        prefill = generate_step(prompt[:-1], model, max_tokens=1, prompt_cache=cache)
+        next(prefill)
+        prefill.close()
+        for layer_cache in cache:
+            self.assertEqual(layer_cache.trim(2), 2)
+        self.assertEqual([entry.offset for entry in cache], [4, 4])
+        resumed = list(
+            generate_step(prompt[-2:], model, max_tokens=3, prompt_cache=cache)
+        )
+        fresh = list(generate_step(prompt, model, max_tokens=3))
+        self.assertEqual(
+            [int(token) for token, _ in resumed], [int(token) for token, _ in fresh]
+        )
+        for (_, resumed_probs), (_, fresh_probs) in zip(resumed, fresh):
+            self.assertTrue(
+                mx.allclose(resumed_probs, fresh_probs, atol=1e-4, rtol=1e-4)
+            )
+
+    def test_singleton_batch_generation_matches_sequential_generation(self):
+        from unittest.mock import patch
+
+        from mlx_lm.generate import BatchGenerator, generate_step
+
+        model = Model(self._args())
+        model.embed.weight = mx.arange(64 * 32, dtype=mx.float32).reshape(64, 32) / 2048
+        model.head.weight = mx.eye(64, 32, dtype=mx.float32)
+        prompt = [1, 2, 3, 4, 5, 6]
+        expected = [
+            int(token)
+            for token, _ in generate_step(mx.array(prompt), model, max_tokens=3)
+        ]
+        with patch.object(mx, "set_wired_limit", return_value=0):
+            generator = BatchGenerator(
+                model, max_tokens=3, completion_batch_size=1, prefill_batch_size=1
+            )
+            try:
+                for _ in range(2):
+                    generator.insert([prompt])
+                    actual = []
+                    for _ in range(10):
+                        responses = generator.next_generated()
+                        if not responses:
+                            break
+                        actual.extend(response.token for response in responses)
+                    self.assertEqual(actual, expected)
+            finally:
+                generator.close()
 
     def test_mixed_bit_strict_loader_runs_prefill_and_cached_decode(self):
         self._assert_mixed_bit_strict_loader(False)
