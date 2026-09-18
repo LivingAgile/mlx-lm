@@ -5728,9 +5728,7 @@ class Model(nn.Module):
             modules[layer_id] = DeepseekV41Engram(
                 self.args.text_config, layer_id, layout, embedding
             )
-            excluded_by_file.setdefault(str(path), set()).update(
-                owned_keys
-            )
+            excluded_by_file.setdefault(str(path), set()).update(owned_keys)
         self._runtime.bind_engram_modules(modules)
         self._sync_runtime()
         return excluded_by_file
@@ -5744,7 +5742,43 @@ class Model(nn.Module):
         official square 32/128 block sizes on both axes.
         """
         if self.args.is_mlx_derivative:
-            return weights
+            mapped = {}
+            projection_names = {
+                "gate_proj": "w1",
+                "down_proj": "w2",
+                "up_proj": "w3",
+            }
+            for name, tensor in weights.items():
+                match = re.fullmatch(
+                    r"layers\.(\d+)\.ffn\.experts\."
+                    r"(gate_proj|down_proj|up_proj)\.(weight|scales|biases)",
+                    name,
+                )
+                if match is None:
+                    if name in mapped:
+                        raise ValueError(f"duplicate derivative tensor {name!r}")
+                    mapped[name] = tensor
+                    continue
+                layer_id = int(match.group(1))
+                if layer_id >= len(self.layers):
+                    raise ValueError(f"checkpoint tensor {name!r} names no model block")
+                experts = self.layers[layer_id].ffn.experts
+                if tensor.ndim != 3 or tensor.shape[0] != len(experts):
+                    raise ValueError(
+                        f"checkpoint tensor {name!r} has invalid expert geometry"
+                    )
+                projection = projection_names[match.group(2)]
+                for expert_id, expert in enumerate(experts):
+                    if expert is None:
+                        continue
+                    target = (
+                        f"layers.{layer_id}.ffn.experts.{expert_id}."
+                        f"{projection}.{match.group(3)}"
+                    )
+                    if target in mapped or target in weights:
+                        raise ValueError(f"duplicate derivative tensor {target!r}")
+                    mapped[target] = tensor[expert_id]
+            return mapped
         weights = dict(weights)
         wo_a_weight_keys = [k for k in weights if k.endswith("wo_a.weight")]
         wo_a_scale_keys = [k for k in weights if k.endswith("wo_a.scale")]

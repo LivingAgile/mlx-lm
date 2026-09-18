@@ -4320,6 +4320,12 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
         )
 
     def test_mixed_bit_strict_loader_runs_prefill_and_cached_decode(self):
+        self._assert_mixed_bit_strict_loader(False)
+
+    def test_publisher_stacked_experts_and_dense_wo_a_strict_loader(self):
+        self._assert_mixed_bit_strict_loader(True)
+
+    def _assert_mixed_bit_strict_loader(self, publisher_layout):
         import mlx.nn as nn
 
         from mlx_lm.utils import load_model
@@ -4339,6 +4345,9 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
         for name, module in tree_flatten(
             model.leaf_modules(), is_leaf=lambda value: isinstance(value, nn.Module)
         ):
+            if publisher_layout and name.endswith(".attn.wo_a"):
+                module.weight = module.weight.astype(mx.bfloat16)
+                continue
             if isinstance(module, DeepseekV41PackedLinear):
                 dense = module.dequantized()
             elif isinstance(module, (nn.Linear, nn.Embedding)):
@@ -4365,9 +4374,27 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
         with tempfile.TemporaryDirectory() as model_directory:
             model_path = Path(model_directory)
             (model_path / "config.json").write_text(json.dumps(config))
+            weights = dict(tree_flatten(model.parameters()))
+            if publisher_layout:
+                for layer_id, layer in enumerate(model.layers):
+                    for projection, checkpoint_name in (
+                        ("w1", "gate_proj"),
+                        ("w2", "down_proj"),
+                        ("w3", "up_proj"),
+                    ):
+                        for leaf in ("weight", "scales", "biases"):
+                            prefix = f"layers.{layer_id}.ffn.experts"
+                            weights[f"{prefix}.{checkpoint_name}.{leaf}"] = mx.stack(
+                                [
+                                    weights.pop(
+                                        f"{prefix}.{expert_id}.{projection}.{leaf}"
+                                    )
+                                    for expert_id in range(len(layer.ffn.experts))
+                                ]
+                            )
             mx.save_safetensors(
                 str(model_path / "model.safetensors"),
-                dict(tree_flatten(model.parameters())),
+                weights,
             )
             loaded, _ = load_model(model_path, strict=True)
             self.assertEqual(loaded.layers[0].ffn.experts[0].w1.bits, 4)
@@ -4382,6 +4409,10 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             self.assertTrue(mx.allclose(decode, full[:, -1:], atol=1e-4, rtol=1e-4))
             for layer in loaded.layers:
                 quantized = layer.attn.wo_a
+                if publisher_layout:
+                    self.assertIsInstance(quantized, nn.Linear)
+                    self.assertEqual(quantized.weight.dtype, mx.bfloat16)
+                    continue
                 dense_weight = mx.dequantize(
                     quantized.weight,
                     quantized.scales,
@@ -4398,6 +4429,53 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             expected = loaded(mx.array([[1, 2, 3, 4]], dtype=mx.int32))
             self.assertTrue(mx.allclose(full, expected, atol=1e-4, rtol=1e-4))
 
+            if publisher_layout:
+
+                class Group:
+                    def __init__(self, rank):
+                        self._rank = rank
+
+                    def size(self):
+                        return 4
+
+                    def rank(self):
+                        return self._rank
+
+                for rank in range(4):
+                    partitioned, _ = load_model(
+                        model_path, strict=True, shard_group=Group(rank)
+                    )
+                    for layer_id, layer in enumerate(partitioned.layers):
+                        expected_ids = list(range(rank * 2, (rank + 1) * 2))
+                        self.assertEqual(layer.ffn.local_expert_ids, expected_ids)
+                        actual_ids = [
+                            expert_id
+                            for expert_id, expert in enumerate(layer.ffn.experts)
+                            if expert is not None
+                        ]
+                        self.assertEqual(actual_ids, expected_ids)
+                        for expert_id in expected_ids:
+                            self.assertTrue(
+                                mx.array_equal(
+                                    layer.ffn.experts[expert_id].w1.weight,
+                                    loaded.layers[layer_id]
+                                    .ffn.experts[expert_id]
+                                    .w1.weight,
+                                )
+                            )
+
+                key = "layers.0.ffn.experts.gate_proj.weight"
+                original = weights[key]
+                weights[key] = original[:-1]
+                mx.save_safetensors(str(model_path / "model.safetensors"), weights)
+                with self.assertRaisesRegex(ValueError, "invalid expert geometry"):
+                    load_model(model_path, strict=True)
+                weights[key] = original
+                weights["layers.0.ffn.experts.0.w1.weight"] = original[0]
+                mx.save_safetensors(str(model_path / "model.safetensors"), weights)
+                with self.assertRaisesRegex(ValueError, "duplicate derivative tensor"):
+                    load_model(model_path, strict=True)
+
     def test_model_shard_preserves_global_expert_names_in_every_backbone_layer(self):
         class Group:
             def size(self):
@@ -4411,9 +4489,7 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
 
         for layer in model.layers:
             self.assertEqual(layer.ffn.local_expert_ids, [4, 5, 6, 7])
-            self.assertEqual(
-                sum(expert is not None for expert in layer.ffn.experts), 4
-            )
+            self.assertEqual(sum(expert is not None for expert in layer.ffn.experts), 4)
         expert_ids = {
             int(name.split(".")[4])
             for name, _ in tree_flatten(model.parameters())
