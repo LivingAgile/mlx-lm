@@ -631,7 +631,6 @@ class TestDeepseekV41QuantPrimitives(unittest.TestCase):
             dequantize_fp4_block(packed, scale, block_size=32)
 
 
-
 def _tiny_text_config(**overrides):
     """A small but structurally faithful config: two compress ratios, two
     kv_source layers, three index sources and a candidate source that is not
@@ -1785,7 +1784,6 @@ class TestDeepseekV41HyperConnections(unittest.TestCase):
                 DeepseekV41HyperConnections(_tiny_hc_text_config(**overrides))
 
 
-
 class TestDeepseekV41RoutingRule(unittest.TestCase):
     """Gate scoring and the noaux_tc selection rule (inference/model.py Gate)."""
 
@@ -2383,12 +2381,15 @@ class TestDeepseekV41ExpertPartition(unittest.TestCase):
         self.assertTrue(np.allclose(np.asarray(out), np.asarray(expected), atol=1e-5))
 
     def test_moe_output_matches_at_world_sizes_one_two_and_four(self):
-        config = _tiny_moe_text_config()
-        x = mx.arange(3 * config.hidden_size, dtype=mx.float32).reshape(
-            1, 3, config.hidden_size
-        ) / 128
+        config = _tiny_moe_text_config(hidden_size=64)
+        x = (
+            mx.arange(3 * config.hidden_size, dtype=mx.float32).reshape(
+                1, 3, config.hidden_size
+            )
+            / 128
+        )
 
-        def initialize(moe):
+        def initialize(moe, quantized=False):
             moe.gate.weight = mx.zeros(moe.gate.weight.shape, dtype=mx.float32)
             moe.gate.bias = mx.array(
                 [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
@@ -2403,37 +2404,59 @@ class TestDeepseekV41ExpertPartition(unittest.TestCase):
                         dtype=mx.float32,
                     )
             _zero_expert(moe.shared_experts)
+            if quantized:
+                for expert in [moe.expert(index) for index in moe.local_expert_ids] + [
+                    moe.shared_experts
+                ]:
+                    bits = 8 if expert is moe.shared_experts else 4
+                    for name in ("w1", "w2", "w3"):
+                        source = getattr(expert, name)
+                        dense = source.weight
+                        if bits == 8:
+                            dense = mx.full(dense.shape, 0.001, dtype=mx.float32)
+                        linear = source.to_quantized(group_size=64, bits=bits)
+                        linear.weight, linear.scales, linear.biases = mx.quantize(
+                            dense, group_size=64, bits=bits
+                        )
+                        setattr(expert, name, linear)
             return moe
 
-        whole = initialize(
-            DeepseekV41MoE(
-                config,
-                expert_quant=None,
-                shared_expert_quant=None,
-                dtype=mx.float32,
+        for quantized in (False, True):
+            whole_model = initialize(
+                DeepseekV41MoE(
+                    config,
+                    expert_quant=None,
+                    shared_expert_quant=None,
+                    dtype=mx.float32,
+                ),
+                quantized,
             )
-        )(x)
-
-        for world_size in (2, 4):
-            partials = []
-            for rank in range(world_size):
-                moe = initialize(
-                    DeepseekV41MoE(
-                        config,
-                        world_size=world_size,
-                        rank=rank,
-                        all_reduce=lambda local: local,
-                        expert_quant=None,
-                        shared_expert_quant=None,
-                        dtype=mx.float32,
+            whole = whole_model(x)
+            shared = whole_model.shared_experts(x)
+            for world_size in (2, 4):
+                ranks = [
+                    initialize(
+                        DeepseekV41MoE(
+                            config,
+                            world_size=world_size,
+                            rank=rank,
+                            all_reduce=lambda local: local,
+                            expert_quant=None,
+                            shared_expert_quant=None,
+                            dtype=mx.float32,
+                        ),
+                        quantized,
                     )
-                )
-                partials.append(moe(x))
-            sharded = sum(partials[1:], start=partials[0])
-            self.assertTrue(
-                mx.allclose(sharded, whole, atol=1e-5, rtol=1e-5).item(),
-                world_size,
-            )
+                    for rank in range(world_size)
+                ]
+                partials = [moe(x) - shared for moe in ranks]
+                routed = sum(partials[1:], start=partials[0])
+                for moe in ranks:
+                    moe.all_reduce = lambda local: routed.reshape(local.shape)
+                    self.assertTrue(
+                        mx.allclose(moe(x), whole, atol=1e-5, rtol=1e-5).item(),
+                        (quantized, world_size),
+                    )
 
     def test_sharded_moe_rejects_an_in_place_reducer_that_returns_none(self):
         config = _tiny_moe_text_config()
@@ -3155,6 +3178,40 @@ class TestDeepseekV41QuantizedEngramRowStore(unittest.TestCase):
                 self.assertEqual(store.rows_read, 2)
                 self.assertEqual(store.bytes_read, 2 * store.row_nbytes)
                 self.assertEqual(cache.nbytes(), 2 * store.row_nbytes)
+            for world_size in (1, 2, 4):
+                partials = []
+                for rank in range(world_size):
+                    with SafetensorsQuantizedEngramRowStore(
+                        path,
+                        bits=6,
+                        row_start=rank * (8 // world_size),
+                        num_rows=8 // world_size,
+                    ) as store:
+                        embedding = DeepseekV41EngramEmbedding(
+                            8,
+                            256,
+                            BoundedEngramRowCache(store, max_rows=8),
+                            rank=rank,
+                            world_size=world_size,
+                            block_size=64,
+                            all_reduce=lambda local: local,
+                        )
+                        cold = embedding(mx.array(wanted))
+                        mx.eval(cold)
+                        reads = store.rows_read
+                        warm = embedding(mx.array(wanted))
+                        self.assertTrue(mx.array_equal(cold, warm).item())
+                        self.assertEqual(store.rows_read, reads)
+                        partials.append(cold.astype(mx.float32))
+                self.assertTrue(
+                    mx.allclose(
+                        sum(partials[1:], start=partials[0]),
+                        expected,
+                        atol=1e-2,
+                        rtol=1e-2,
+                    ).item(),
+                    world_size,
+                )
 
     def test_six_bit_geometry_is_validated_before_any_row_read(self):
         weight = np.zeros((2, 47), dtype=np.uint32)
@@ -4262,6 +4319,85 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
             )
         )
 
+    def test_mixed_bit_strict_loader_runs_prefill_and_cached_decode(self):
+        import mlx.nn as nn
+
+        from mlx_lm.utils import load_model
+
+        config = TestDeepseekV41DerivativeProfile()._config()
+        config["text_config"] = asdict(self._args().text_config) | {
+            "hidden_size": 64,
+            "q_lora_rank": 64,
+            "head_dim": 64,
+            "o_lora_rank": 32,
+        }
+        config["vision_config"] = asdict(self._args().vision_config)
+        model = Model(ModelArgs.from_dict(config))
+        model.embed.weight = mx.arange(64 * 64, dtype=mx.float32).reshape(64, 64) / 4096
+        model.head.weight = mx.eye(64, dtype=mx.float32)
+        dense_weights = {}
+        for name, module in tree_flatten(
+            model.leaf_modules(), is_leaf=lambda value: isinstance(value, nn.Module)
+        ):
+            if isinstance(module, DeepseekV41PackedLinear):
+                dense = module.dequantized()
+            elif isinstance(module, (nn.Linear, nn.Embedding)):
+                dense = module.weight
+            else:
+                continue
+            if dense.shape[-1] % 64 == 0:
+                dense_weights[name] = mx.random.normal(dense.shape) * 0.02
+
+        def quantization_policy(name, module):
+            if name not in dense_weights:
+                return False
+            return {"group_size": 64, "bits": 4 if ".ffn.experts." in name else 8}
+
+        nn.quantize(model, class_predicate=quantization_policy)
+        for name, module in tree_flatten(
+            model.leaf_modules(), is_leaf=lambda value: isinstance(value, nn.Module)
+        ):
+            if name in dense_weights:
+                module.weight, module.scales, module.biases = mx.quantize(
+                    dense_weights[name], group_size=64, bits=module.bits
+                )
+
+        with tempfile.TemporaryDirectory() as model_directory:
+            model_path = Path(model_directory)
+            (model_path / "config.json").write_text(json.dumps(config))
+            mx.save_safetensors(
+                str(model_path / "model.safetensors"),
+                dict(tree_flatten(model.parameters())),
+            )
+            loaded, _ = load_model(model_path, strict=True)
+            self.assertEqual(loaded.layers[0].ffn.experts[0].w1.bits, 4)
+            self.assertEqual(loaded.layers[0].attn.wq_a.bits, 8)
+            cache = loaded.make_cache()
+            prefill = loaded(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+            decode = loaded(mx.array([[4]], dtype=mx.int32), cache=cache)
+            full = loaded(mx.array([[1, 2, 3, 4]], dtype=mx.int32))
+            self.assertTrue(np.isfinite(np.asarray(prefill)).all())
+            self.assertGreater(float(mx.max(mx.abs(prefill))), 0.0)
+            self.assertEqual([entry.offset for entry in cache], [4, 4])
+            self.assertTrue(mx.allclose(decode, full[:, -1:], atol=1e-4, rtol=1e-4))
+            for layer in loaded.layers:
+                quantized = layer.attn.wo_a
+                dense_weight = mx.dequantize(
+                    quantized.weight,
+                    quantized.scales,
+                    quantized.biases,
+                    group_size=quantized.group_size,
+                    bits=quantized.bits,
+                    mode=quantized.mode,
+                )
+                dense_projection = nn.Linear(
+                    dense_weight.shape[1], dense_weight.shape[0], bias=False
+                )
+                dense_projection.weight = dense_weight
+                layer.attn.wo_a = dense_projection
+            expected = loaded(mx.array([[1, 2, 3, 4]], dtype=mx.int32))
+            self.assertTrue(mx.allclose(full, expected, atol=1e-4, rtol=1e-4))
+
     def test_model_shard_preserves_global_expert_names_in_every_backbone_layer(self):
         class Group:
             def size(self):
@@ -4521,4 +4657,3 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

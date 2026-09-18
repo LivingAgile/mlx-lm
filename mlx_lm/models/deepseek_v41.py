@@ -1914,11 +1914,23 @@ class DeepseekV41Attention(nn.Module):
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         o = apply_rope_tail(o, cos, sin, self.rope_head_dim, inverse=True)
         wo_a = self.wo_a.weight.reshape(self.n_groups, self.o_lora_rank, -1)
-        o = mx.einsum(
-            "bsgd,grd->bsgr",
-            o.reshape(batch, seqlen, self.n_groups, -1),
-            wo_a.astype(o.dtype),
-        )
+        if isinstance(self.wo_a, (nn.QuantizedLinear, DeepseekV41QuantizedLinear)):
+            o = mx.quantized_matmul(
+                o.reshape(batch, seqlen, self.n_groups, 1, -1),
+                wo_a,
+                scales=self.wo_a.scales.reshape(self.n_groups, self.o_lora_rank, -1),
+                biases=self.wo_a.biases.reshape(self.n_groups, self.o_lora_rank, -1),
+                transpose=True,
+                group_size=self.wo_a.group_size,
+                bits=self.wo_a.bits,
+                mode=self.wo_a.mode,
+            ).squeeze(-2)
+        else:
+            o = mx.einsum(
+                "bsgd,grd->bsgr",
+                o.reshape(batch, seqlen, self.n_groups, -1),
+                wo_a.astype(o.dtype),
+            )
         out = self.wo_b(o.reshape(batch, seqlen, -1))
         cache.offset = start_pos + seqlen
         return out
@@ -5529,7 +5541,7 @@ class Model(nn.Module):
         self.norm = transformer.norm
         self.head = transformer.head
         self.mtp = transformer.mtp
-        self._runtime = transformer
+        object.__setattr__(self, "_runtime", transformer)
         if hasattr(transformer, "vision"):
             self.vision = transformer.vision
             self.aligner = transformer.aligner
