@@ -4543,13 +4543,16 @@ class DeepseekV41EngramEmbedding(nn.Module):
         self.part_num_embeddings = -(-self.num_embeddings // self.world_size)
         self.vocab_start_idx = self.rank * self.part_num_embeddings
         self.vocab_end_idx = self.vocab_start_idx + self.part_num_embeddings
-        if cache.store.num_rows != self.part_num_embeddings:
+        physical_rows = max(
+            0, min(self.part_num_embeddings, self.num_embeddings - self.vocab_start_idx)
+        )
+        if cache.store.num_rows not in (physical_rows, self.part_num_embeddings):
             raise ValueError(
                 f"the row store holds {cache.store.num_rows} rows but rank "
                 f"{self.rank} of {self.world_size} owns "
                 f"{self.part_num_embeddings} rows of the {self.num_embeddings}-row "
-                "table; every rank allocates ceil(rows / world_size), padding "
-                "included"
+                "table; the store must hold the physical rows or the full "
+                "padded partition"
             )
         self.cache = cache
         self.all_reduce = all_reduce
@@ -5688,12 +5691,14 @@ class Model(nn.Module):
                     f"file-backed Engram tensors {owned_keys} must share one "
                     "safetensors file"
                 )
+            partition_rows = -(-num_embeddings // world_size)
+            row_start = rank * partition_rows
             store_args = {
                 "path": str(path),
                 "weight_key": weight_key,
                 "scale_key": scale_key,
-                "row_start": rank * (-(-num_embeddings // world_size)),
-                "num_rows": -(-num_embeddings // world_size),
+                "row_start": row_start,
+                "num_rows": min(partition_rows, num_embeddings - row_start),
             }
             store = (
                 SafetensorsQuantizedEngramRowStore(

@@ -3282,7 +3282,7 @@ class TestDeepseekV41DerivativeProfile(unittest.TestCase):
         config = self._config()
         text = config["text_config"] | {
             "engram_layer_ids": [0],
-            "engram_num_embeddings": [408],
+            "engram_num_embeddings": [410],
             "engram_max_ngram_size": 3,
             "engram_vocab_size": 97,
             "engram_n_heads": 2,
@@ -3292,7 +3292,10 @@ class TestDeepseekV41DerivativeProfile(unittest.TestCase):
         }
         config["text_config"] = text
         model = Model(ModelArgs.from_dict(config))
-        dense = mx.zeros((408, 256), dtype=mx.bfloat16)
+        from types import SimpleNamespace
+
+        model.prepare_sharded_load(SimpleNamespace(size=lambda: 4, rank=lambda: 3))
+        dense = mx.zeros((410, 256), dtype=mx.bfloat16)
         weight, scales, biases = mx.quantize(dense, group_size=64, bits=6)
         prefix = "layers.0.engram.embed."
         with tempfile.TemporaryDirectory() as tmp:
@@ -3312,7 +3315,12 @@ class TestDeepseekV41DerivativeProfile(unittest.TestCase):
             store = model.layers[0].engram.embed.cache.store
             self.assertIsInstance(store, SafetensorsQuantizedEngramRowStore)
             self.assertEqual((store.bits, store.group_size), (6, 64))
+            self.assertEqual((store.row_start, store.num_rows), (309, 101))
             self.assertEqual(store.bytes_read, 0)
+            store.read_rows([100])
+            self.assertEqual(store.rows_read, 1)
+            with self.assertRaises(IndexError):
+                store.read_rows([101])
             store.close()
 
     def test_derivative_sanitize_does_not_apply_official_wo_a_rules(self):
