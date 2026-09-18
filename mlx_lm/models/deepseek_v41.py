@@ -5748,7 +5748,8 @@ class Model(nn.Module):
                 "down_proj": "w2",
                 "up_proj": "w3",
             }
-            for name, tensor in weights.items():
+            for name in list(weights):
+                tensor = weights[name]
                 match = re.fullmatch(
                     r"layers\.(\d+)\.ffn\.experts\."
                     r"(gate_proj|down_proj|up_proj)\.(weight|scales|biases)",
@@ -5768,6 +5769,7 @@ class Model(nn.Module):
                         f"checkpoint tensor {name!r} has invalid expert geometry"
                     )
                 projection = projection_names[match.group(2)]
+                local_tensors = {}
                 for expert_id, expert in enumerate(experts):
                     if expert is None:
                         continue
@@ -5777,7 +5779,10 @@ class Model(nn.Module):
                     )
                     if target in mapped or target in weights:
                         raise ValueError(f"duplicate derivative tensor {target!r}")
-                    mapped[target] = tensor[expert_id]
+                    local_tensors[target] = tensor[expert_id]
+                mx.eval(local_tensors)
+                mapped.update(local_tensors)
+                del weights[name], tensor
             return mapped
         weights = dict(weights)
         wo_a_weight_keys = [k for k in weights if k.endswith("wo_a.weight")]

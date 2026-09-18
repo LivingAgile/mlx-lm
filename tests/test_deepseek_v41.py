@@ -4325,6 +4325,46 @@ class TestDeepseekV41ModelComposition(unittest.TestCase):
     def test_publisher_stacked_experts_and_dense_wo_a_strict_loader(self):
         self._assert_mixed_bit_strict_loader(True)
 
+    def test_stacked_expert_sanitize_bounds_materialization_peak(self):
+        import gc
+        from types import SimpleNamespace
+
+        config = TestDeepseekV41DerivativeProfile()._config()
+        config["text_config"] = asdict(self._args().text_config)
+        config["vision_config"] = asdict(self._args().vision_config)
+        model = Model(ModelArgs.from_dict(config))
+        model.prepare_sharded_load(SimpleNamespace(size=lambda: 4, rank=lambda: 0))
+        mx.eval(model.parameters())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.safetensors"
+            source = {
+                f"layers.{layer_id}.ffn.experts.{projection}.weight": mx.full(
+                    (8, 512, 512), layer_id + 1, dtype=mx.uint32
+                )
+                for layer_id in range(2)
+                for projection in ("gate_proj", "down_proj")
+            }
+            mx.save_safetensors(str(path), source)
+            del source
+            gc.collect()
+            mx.clear_cache()
+            baseline = mx.get_active_memory()
+            mx.reset_peak_memory()
+            weights = mx.load(str(path))
+            mapped = model.sanitize(weights)
+            del weights
+            mx.eval(mapped)
+            stack_bytes = 8 * 512 * 512 * 4
+            local_bytes = sum(value.nbytes for value in mapped.values())
+            self.assertEqual(local_bytes, stack_bytes)
+            self.assertLess(
+                mx.get_peak_memory() - baseline,
+                local_bytes + 2 * stack_bytes,
+            )
+            self.assertEqual(len(mapped), 8)
+            for name, value in mapped.items():
+                self.assertTrue(mx.all(value == int(name.split(".")[1]) + 1))
+
     def _assert_mixed_bit_strict_loader(self, publisher_layout):
         import mlx.nn as nn
 
