@@ -2659,6 +2659,15 @@ class TestDeepseekV41EngramNormalization(unittest.TestCase):
         self.assertEqual(normalize_engram_token_text("cafe\u0301"), "cafe")
         self.assertEqual(normalize_engram_token_text("\u00c9\u00c0"), "ea")
 
+    def test_spacing_marks_match_the_training_normalizer(self):
+        self.assertEqual(normalize_engram_token_text("\u09be\u09b0"), "\u09b0")
+        self.assertEqual(normalize_engram_token_text("\u093e"), "")
+        lookup, size = build_engram_compressed_token_map(
+            ["\u09be\u09b0", "\u09b0", "\u093e"], [None, None, None]
+        )
+        self.assertEqual(lookup, [0, 0, 1])
+        self.assertEqual(size, 2)
+
     def test_compatibility_forms_are_folded(self):
         self.assertEqual(normalize_engram_token_text("\uff21\uff22"), "ab")
 
