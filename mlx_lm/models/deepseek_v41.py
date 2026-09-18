@@ -4190,14 +4190,13 @@ class SafetensorsQuantizedEngramRowStore(EngramRowStore):
             header, bias_key, "BF16", 2, file_size
         )
         self.full_num_rows, self.packed_dim = weight_shape
-        self.scale_dim = scale_shape[1]
+        self.dim = scale_shape[1] * self.group_size
         if scale_shape != bias_shape or scale_shape[0] != self.full_num_rows:
             raise ValueError(
                 f"{self.path} quantized Engram scales {scale_shape} and biases "
                 f"{bias_shape} must share the weight row count "
                 f"{self.full_num_rows}"
             )
-        self.dim = self.scale_dim * self.group_size
         expected_packed_dim = (
             self.scale_dim * self.bits * self.group_size // 32
         )
@@ -5707,6 +5706,7 @@ class Model(nn.Module):
                 cache,
                 rank=rank,
                 world_size=world_size,
+                block_size=store.block_size,
                 all_reduce=(
                     None
                     if world_size == 1

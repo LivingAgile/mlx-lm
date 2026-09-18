@@ -3131,14 +3131,14 @@ class TestDeepseekV41EngramRowStore(unittest.TestCase):
 class TestDeepseekV41QuantizedEngramRowStore(unittest.TestCase):
     def test_selected_six_bit_rows_match_mlx_dequantize(self):
         rng = np.random.default_rng(41)
-        dense = mx.array(rng.normal(size=(8, 256)).astype(np.float32))
+        dense = mx.array(rng.normal(size=(8, 256)), dtype=mx.bfloat16)
         weight, scales, biases = mx.quantize(dense, group_size=64, bits=6)
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_quantized_engram_fixture(
                 os.path.join(tmp, "engram6.safetensors"),
                 np.asarray(weight),
-                np.asarray(scales).view(np.uint16),
-                np.asarray(biases).view(np.uint16),
+                np.asarray(scales.view(mx.uint16)),
+                np.asarray(biases.view(mx.uint16)),
             )
             with SafetensorsQuantizedEngramRowStore(path, bits=6) as store:
                 cache = BoundedEngramRowCache(store, max_rows=2)
@@ -3235,7 +3235,7 @@ class TestDeepseekV41DerivativeProfile(unittest.TestCase):
         }
         config["text_config"] = text
         model = Model(ModelArgs.from_dict(config))
-        dense = mx.zeros((408, 256), dtype=mx.float32)
+        dense = mx.zeros((408, 256), dtype=mx.bfloat16)
         weight, scales, biases = mx.quantize(dense, group_size=64, bits=6)
         prefix = "layers.0.engram.embed."
         with tempfile.TemporaryDirectory() as tmp:
@@ -3243,8 +3243,8 @@ class TestDeepseekV41DerivativeProfile(unittest.TestCase):
             _write_quantized_engram_fixture(
                 path,
                 np.asarray(weight),
-                np.asarray(scales).view(np.uint16),
-                np.asarray(biases).view(np.uint16),
+                np.asarray(scales.view(mx.uint16)),
+                np.asarray(biases.view(mx.uint16)),
                 prefix=prefix,
             )
             excluded = model.prepare_file_backed_weights(Path(tmp), [path])
