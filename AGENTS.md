@@ -53,3 +53,46 @@ AI-generated responses and the penalty is a project ban.
   # KeyError instead of reading an empty answer. Streaming deltas
   # are left alone: omitting fields between chunks is normal there.
 ```
+
+## LivingAgile Cluster Model Ops Fork Scope Addendum
+
+For owner-directed Cluster Model Ops development in LivingAgile/mlx-lm on branches
+under cluster-modelops/, AI agents may author code, tests, documentation and commit
+messages, commit and push feature branches, and integrate selected changes into
+cluster-modelops/integration. This includes publishing fork source needed for builds
+and carrying this owner policy onto preserved integration and feature lineages.
+
+For the owner-directed fork development defined here, this addendum takes
+precedence over conflicting Agent rules and examples earlier in this file.
+The inherited restrictions concerning commit messages, PR descriptions, replies,
+pushes and submissions remain applicable to upstream-targeted work.
+
+No upstream issue, PR, reply or readiness transition is authorized by this
+addendum. Follow the upstream target's current instructions for those actions.
+All non-conflicting instructions, including code standards, remain in force.
+
+Preserve licenses, attribution, code standards and required checks. Verify the exact
+LivingAgile/mlx-lm push destination and inspect outgoing history for secrets, private
+ancestry and unrelated material.
+
+Agents may migrate agent-created Cluster Model Ops branches outside the
+cluster-modelops/ namespace into that namespace. This permission applies to the
+legacy source branches specifically for migration, despite the namespace restriction
+above. Preserve their commits and attribution, and apply this addendum to the
+replacement branches.
+
+Before deleting an original local or remote branch, verify that its replacement
+preserves every source commit, that the remote replacement is published and resolves
+to the intended commit, and that affected worktrees, build references, automation
+and open pull requests have been checked and updated where authorized. Record the
+old and new names and commit IDs so the original ref can be restored. Do not delete
+a branch while active work or an unresolved dependency still relies on it.
+
+This authority covers only branches verified as agent-created for our Cluster Model
+Ops work. Preserve unrelated branches and work. Do not force-push, change protections,
+alter main or delete upstream branches. If branch ownership or dependency safety is
+uncertain, obtain the owner's decision before deletion.
+
+Keep source revisions pinned; publication or branch migration does not authorize
+deployment. Prepare upstream contributions on clean upstream-based branches,
+excluding this fork-only policy from both the diff and outgoing history.
